@@ -6,3 +6,25 @@ license = "Apache-2.0"
 description = "CLI tool for Cardano treasury contracts: milestone management and withdrawal creation"
 
 [dependencies]
+# Cardano primitives and tx building
+pallas = "0.32"
+pallas-txbuilder = "1.0.0-alpha.5"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Async runtime + HTTP
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
