@@ -40,9 +40,9 @@ impl Portal {
             query {
                 instances {
                     identifier label description
-                    expiration { posixMs }
-                    payoutUpperbound { posixMs }
-                    vendorExpiration { posixMs }
+                    expiration { unixMilli }
+                    payoutUpperbound { unixMilli }
+                    vendorExpiration { unixMilli }
                     registry {
                         treasuryScript { scriptHash scriptReference { transaction index } }
                         vendorScript   { scriptHash scriptReference { transaction index } }
@@ -62,9 +62,9 @@ impl Portal {
             query InstanceById($id: String!) {
                 instanceById(ID: $id) {
                     identifier label description
-                    expiration { posixMs }
-                    payoutUpperbound { posixMs }
-                    vendorExpiration { posixMs }
+                    expiration { unixMilli }
+                    payoutUpperbound { unixMilli }
+                    vendorExpiration { unixMilli }
                     registry {
                         treasuryScript { scriptHash scriptReference { transaction index } }
                         vendorScript   { scriptHash scriptReference { transaction index } }
@@ -74,13 +74,13 @@ impl Portal {
                         vendor { label }
                         milestones {
                             identifier label description acceptanceCriteria
-                            maturation { posixMs }
+                            maturation { unixMilli }
                             status
-                            completions { description evidence { anchorUrl anchorDataHash } }
+                            completions { description evidence { anchorUrl hash } }
                         }
                         unspentOutput {
                             transaction index address datumHex
-                            value { policyId assetName quantity }
+                            value { assetId quantity }
                         }
                     }
                 }
@@ -127,8 +127,8 @@ pub struct RegistryInfo {
 
 #[derive(Debug, Clone)]
 pub struct AssetValue {
-    pub policy_id: String,
-    pub asset_name: String,
+    /// Empty string for lovelace; "<policyId><assetName>" for native assets
+    pub asset_id: String,
     pub quantity: i64,
 }
 
@@ -150,7 +150,7 @@ pub struct Completion {
 #[derive(Debug, Clone)]
 pub struct CompletionEvidence {
     pub anchor_url: String,
-    pub anchor_data_hash: Option<String>,
+    pub hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -312,7 +312,7 @@ fn parse_completion(v: &Value) -> Result<Completion> {
                     .map(|e| {
                         Ok(CompletionEvidence {
                             anchor_url: str(e, "anchorUrl")?,
-                            anchor_data_hash: e["anchorDataHash"].as_str().map(str::to_string),
+                            hash: e["hash"].as_str().map(str::to_string),
                         })
                     })
                     .collect::<Result<Vec<_>>>()
@@ -333,10 +333,14 @@ fn parse_project_output(v: &Value) -> Result<ProjectOutput> {
             .map(|arr| {
                 arr.iter()
                     .map(|a| {
+                        let qty_raw = &a["quantity"];
+                        let quantity = qty_raw
+                            .as_i64()
+                            .or_else(|| qty_raw.as_str().and_then(|s| s.parse().ok()))
+                            .context("value.quantity")?;
                         Ok(AssetValue {
-                            policy_id: str(a, "policyId")?,
-                            asset_name: str(a, "assetName")?,
-                            quantity: a["quantity"].as_i64().context("value.quantity")?,
+                            asset_id: str(a, "assetId")?,
+                            quantity,
                         })
                     })
                     .collect::<Result<Vec<_>>>()
@@ -354,7 +358,12 @@ fn str(v: &Value, key: &str) -> Result<String> {
 }
 
 fn posix_ms(v: &Value, key: &str) -> Result<u64> {
-    v[key]["posixMs"]
-        .as_u64()
-        .with_context(|| format!("missing posixMs on '{key}'"))
+    // unixMilli is returned as a JSON string by the portal
+    let raw = &v[key]["unixMilli"];
+    if let Some(n) = raw.as_u64() {
+        return Ok(n);
+    }
+    raw.as_str()
+        .and_then(|s| s.parse().ok())
+        .with_context(|| format!("missing unixMilli on '{key}'"))
 }

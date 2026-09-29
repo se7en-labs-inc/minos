@@ -93,7 +93,7 @@ async fn cmd_status(portal: &Portal, instance_id: &str) -> Result<()> {
             let lovelace: u64 = output
                 .value
                 .iter()
-                .find(|v| v.policy_id.is_empty())
+                .find(|v| v.asset_id.is_empty())
                 .map(|v| v.quantity as u64)
                 .unwrap_or(0);
             println!("  UTxO:   {}#{}", output.transaction, output.index);
