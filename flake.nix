@@ -2,7 +2,7 @@
   description = "Minos — Cardano treasury contract milestone and withdrawal tooling";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-parts.url = "github:hercules-ci/flake-parts";
     crane.url = "github:ipetkov/crane";
     fenix.url = "github:nix-community/fenix";
