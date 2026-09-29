@@ -1,0 +1,8 @@
+[package]
+name = "minos"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "CLI tool for Cardano treasury contracts: milestone management and withdrawal creation"
+
+[dependencies]
