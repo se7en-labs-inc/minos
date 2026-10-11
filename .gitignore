@@ -2,3 +2,28 @@ target
 result
 .direnv
 .claude/settings.local.json
+
+elm-stuff
+minos-ui/main.js
+
+# Local wallet material and transaction artifacts
+/wallet.asc
+/wallet.mnemonic
+/*.txbody
+/*.txsigned
+/*.txwit*
+/*-signed.json
+/*-unsigned.json
+/adjudicate*.json
+/complete.json
+/fund.json
+/mint.json
+/modify*.json
+/publish*.json
+/withdraw.json
+
+# Local portal configuration and persistent state
+/minos-portal.toml
+/minos-portal.db/
+/minos-portal.db-events.duckdb*
+*~
