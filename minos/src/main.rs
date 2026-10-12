@@ -2495,10 +2495,10 @@ async fn cmd_submit(
         let tx_hash = koios.submit_tx(&cbor_hex).await?;
         println!("Submitted: {tx_hash}");
     }
-    match portal.new_transaction(label, &cbor_hex).await {
-        Ok(_) => println!("Registered with portal."),
-        Err(e) => eprintln!("Portal registration skipped: {e}"),
-    }
+    portal.register_transaction(label, &cbor_hex).await.context(
+        "portal registration failed; registration does not submit transactions; retry with --portal-only"
+    )?;
+    println!("Registered with portal.");
     Ok(())
 }
 

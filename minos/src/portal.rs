@@ -90,14 +90,20 @@ impl Portal {
         parse_instance(&data["instanceById"])
     }
 
-    pub async fn new_transaction(&self, label: &str, cbor_hex: &str) -> Result<()> {
+    /// Uses the explicit registration-only mutation. Never fall back to a remote
+    /// newTransaction implementation, which may also submit to the chain.
+    pub async fn register_transaction(&self, label: &str, cbor_hex: &str) -> Result<()> {
         let q = r#"
             mutation NewTx($tx: TransactionInput!) {
-                newTransaction(tx: $tx) { ok }
+                registerTransaction(tx: $tx) { ok }
             }
         "#;
         let vars = json!({ "tx": { "label": label, "cborHex": cbor_hex } });
-        self.query(q, Some(vars)).await?;
+        let data = self.query(q, Some(vars)).await?;
+        anyhow::ensure!(
+            data["registerTransaction"]["ok"].as_bool() == Some(true),
+            "portal did not confirm registration"
+        );
         Ok(())
     }
 }

@@ -35,6 +35,16 @@ pub struct Store {
 }
 
 impl Store {
+    #[cfg(test)]
+    pub fn temporary() -> Self {
+        let duck = Connection::open_in_memory().unwrap();
+        duck.execute_batch(EVENTS_DDL).unwrap();
+        Self {
+            sled: sled::Config::new().temporary(true).open().unwrap(),
+            duck: Mutex::new(duck),
+        }
+    }
+
     pub fn open(path: &str) -> Result<Self> {
         let sled = sled::open(path).with_context(|| format!("open sled at {path}"))?;
 
@@ -304,11 +314,50 @@ impl Store {
     // Registered transactions (from newTransaction mutation)
     // -----------------------------------------------------------------------
 
-    pub fn store_registered_tx(&self, tx: &RegisteredTx) -> Result<()> {
+    /// Atomically register once per body hash; retries preserve the first record.
+    pub fn store_registered_tx(
+        &self,
+        tx: &RegisteredTx,
+        instance: Option<&Instance>,
+    ) -> Result<bool> {
+        use sled::transaction::Transactional;
         let tree = self.sled.open_tree(TREE_REGISTERED_TXS)?;
+        let instances = self.sled.open_tree(TREE_INSTANCES)?;
+        let tracked = self.sled.open_tree(TREE_TRACKED_INSTANCES)?;
         let bytes = serde_json::to_vec(tx)?;
-        tree.insert(tx.tx_hash.as_bytes(), bytes)?;
-        Ok(())
+        let instance_bytes = instance.map(serde_json::to_vec).transpose()?;
+        let tracked_bytes = instance
+            .map(|i| {
+                serde_json::to_vec(&TrackedInstance {
+                    id: i.id.clone(),
+                    network: i.network.clone(),
+                })
+            })
+            .transpose()?;
+        let result: std::result::Result<bool, sled::transaction::TransactionError<sled::Error>> =
+            (&tree, &instances, &tracked).transaction(|(txs, instances, tracked)| {
+                if txs.get(tx.tx_hash.as_bytes())?.is_some() {
+                    return Ok(false);
+                }
+                if let Some(inst) = instance {
+                    // Registration must not overwrite an already indexed instance.
+                    if instances.get(inst.id.as_bytes())?.is_none() {
+                        instances.insert(
+                            inst.id.as_bytes(),
+                            instance_bytes.as_ref().unwrap().as_slice(),
+                        )?;
+                    }
+                    if tracked.get(inst.id.as_bytes())?.is_none() {
+                        tracked.insert(
+                            inst.id.as_bytes(),
+                            tracked_bytes.as_ref().unwrap().as_slice(),
+                        )?;
+                    }
+                }
+                txs.insert(tx.tx_hash.as_bytes(), bytes.as_slice())?;
+                Ok(true)
+            });
+        Ok(result?)
     }
 
     pub fn get_registered_txs(&self) -> Result<Vec<RegisteredTx>> {

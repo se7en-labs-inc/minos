@@ -174,44 +174,28 @@ impl Mutation {
         ctx: &Context<'_>,
         tx: TransactionInput,
     ) -> async_graphql::Result<TransactionResult> {
+        self.register_transaction(ctx, tx).await
+    }
+
+    /// Register authenticated transaction data without submitting to the chain.
+    async fn register_transaction(
+        &self,
+        ctx: &Context<'_>,
+        tx: TransactionInput,
+    ) -> async_graphql::Result<TransactionResult> {
         let cfg = ctx.data::<Config>()?;
-        if !cfg.allowed_authors.is_empty() {
-            let signers = extract_required_signers(&tx.cbor_hex);
-            let ok = signers.iter().any(|s| cfg.allowed_authors.contains(s));
-            if !ok {
-                return Err("no authorized transaction authors in the required signers".into());
-            }
-        }
+        let tx_hash = verified_registration(&tx.cbor_hex, &cfg.allowed_authors)
+            .map_err(|e| async_graphql::Error::new(format!("{e:#}")))?;
         let store = ctx.data::<Arc<Store>>()?;
-
-        // Submit to chain if a node socket is configured
-        if let Ok(node) = ctx.data::<Arc<PortalNode>>() {
-            match node.submit_tx(&tx.cbor_hex).await {
-                Ok(hash) => tracing::info!("submitted tx {hash} via node socket"),
-                Err(e) => {
-                    return Err(async_graphql::Error::new(format!(
-                        "tx submission failed: {e:#}"
-                    )))
-                }
-            }
-        }
-
-        let tx_hash = extract_tx_hash(&tx.cbor_hex).unwrap_or_else(|| "unknown".to_string());
         let registered = crate::db::RegisteredTx {
             tx_hash: tx_hash.clone(),
             label: tx.label.clone(),
             cbor_hex: tx.cbor_hex.clone(),
             submitted_at_ms: chrono::Utc::now().timestamp_millis() as u64,
         };
-        store
-            .store_registered_tx(&registered)
-            .map_err(|e| e.to_string())?;
-
-        // Auto-register instance if this tx carries a CIP-100 publish event.
-        if let Some(pub_info) = extract_publish_metadata_from_cbor(&tx.cbor_hex) {
+        let instance = extract_publish_metadata_from_cbor(&tx.cbor_hex).map(|pub_info| {
             let network = cfg.network();
-            let _ = store.register_instance(&pub_info.instance_id, network);
-            let _ = store.upsert_instance(&crate::types::Instance {
+            crate::types::Instance {
                 id: pub_info.instance_id.clone(),
                 label: pub_info.label,
                 description: pub_info.description,
@@ -224,14 +208,11 @@ impl Mutation {
                 vendor_ref: None,
                 publish_tx: tx_hash.clone(),
                 network: network.to_string(),
-            });
-            tracing::info!(
-                "auto-registered instance {} treasury={} vendor={} from newTransaction",
-                pub_info.instance_id,
-                pub_info.treasury_hash,
-                pub_info.vendor_hash,
-            );
-        }
+            }
+        });
+        store
+            .store_registered_tx(&registered, instance.as_ref())
+            .map_err(|e| e.to_string())?;
 
         Ok(TransactionResult { ok: true })
     }
@@ -772,11 +753,167 @@ fn extract_required_signers(cbor_hex: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Extract the transaction hash from a Conway tx CBOR hex string.
-fn extract_tx_hash(cbor_hex: &str) -> Option<String> {
-    use pallas_crypto::hash::Hasher;
-    let bytes = hex::decode(cbor_hex).ok()?;
-    let tx: Tx<'_> = minicbor::decode(&bytes).ok()?;
+/// Authenticate the original body, and bind metadata to its signed hash.
+/// This proves authorship only, not ledger validity or confirmation.
+fn verified_registration(cbor_hex: &str, allowed: &[String]) -> anyhow::Result<String> {
+    use anyhow::{ensure, Context as _};
+    use pallas_codec::utils::Nullable;
+    use pallas_crypto::{
+        hash::Hasher,
+        key::ed25519::{PublicKey, Signature},
+    };
+    let bytes = hex::decode(cbor_hex).context("invalid transaction hex")?;
+    let mut decoder = minicbor::Decoder::new(&bytes);
+    let tx: Tx<'_> = decoder.decode().context("invalid Conway transaction")?;
+    ensure!(
+        decoder.position() == bytes.len(),
+        "trailing transaction bytes"
+    );
+    ensure!(
+        tx.success,
+        "cannot register a transaction marked script-invalid"
+    );
+    match (&tx.auxiliary_data, &tx.transaction_body.auxiliary_data_hash) {
+        (Nullable::Some(aux), Some(expected)) => ensure!(
+            Hasher::<256>::hash(aux.raw_cbor()) == *expected,
+            "auxiliary data hash mismatch"
+        ),
+        (Nullable::Null | Nullable::Undefined, None) => {}
+        _ => anyhow::bail!("auxiliary data and its body hash must both be present"),
+    }
     let hash = Hasher::<256>::hash(tx.transaction_body.raw_cbor());
-    Some(hex::encode(hash.as_ref()))
+    if !allowed.is_empty() {
+        let mut authorized = false;
+        if let Some(witnesses) = &tx.transaction_witness_set.vkeywitness {
+            for witness in witnesses.iter() {
+                let key = PublicKey::try_from(witness.vkey.as_slice())
+                    .context("invalid witness public key")?;
+                let signature = Signature::try_from(witness.signature.as_slice())
+                    .context("invalid witness signature")?;
+                let key_hash = Hasher::<224>::hash(witness.vkey.as_slice()).to_string();
+                if allowed.iter().any(|a| a.eq_ignore_ascii_case(&key_hash))
+                    && key.verify(hash.as_ref(), &signature)
+                {
+                    authorized = true;
+                }
+            }
+        }
+        ensure!(
+            authorized,
+            "no valid witness from an authorized transaction author"
+        );
+    }
+    Ok(hash.to_string())
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use pallas_crypto::{hash::Hasher, key::ed25519::SecretKey};
+
+    // Public deterministic test key, unrelated to any wallet.
+    fn fixture(fee: u64, signed_fee: Option<u64>, key: &SecretKey) -> String {
+        fn body(fee: u64, key: &SecretKey) -> Vec<u8> {
+            let mut e = minicbor::Encoder::new(Vec::new());
+            e.map(4)
+                .unwrap()
+                .u8(0)
+                .unwrap()
+                .array(0)
+                .unwrap()
+                .u8(1)
+                .unwrap()
+                .array(0)
+                .unwrap()
+                .u8(2)
+                .unwrap()
+                .u64(fee)
+                .unwrap()
+                .u8(14)
+                .unwrap()
+                .array(1)
+                .unwrap()
+                .bytes(Hasher::<224>::hash(key.public_key().as_ref()).as_ref())
+                .unwrap();
+            e.into_writer()
+        }
+        let mut tx = vec![0x84];
+        tx.extend(body(fee, key));
+        let mut e = minicbor::Encoder::new(Vec::new());
+        if let Some(signed_fee) = signed_fee {
+            let hash = Hasher::<256>::hash(&body(signed_fee, key));
+            e.map(1)
+                .unwrap()
+                .u8(0)
+                .unwrap()
+                .array(1)
+                .unwrap()
+                .array(2)
+                .unwrap()
+                .bytes(key.public_key().as_ref())
+                .unwrap()
+                .bytes(key.sign(hash).as_ref())
+                .unwrap();
+        } else {
+            e.map(0).unwrap();
+        }
+        tx.extend(e.into_writer());
+        tx.extend([0xf5, 0xf6]);
+        hex::encode(tx)
+    }
+    fn author(key: &SecretKey) -> String {
+        Hasher::<224>::hash(key.public_key().as_ref()).to_string()
+    }
+
+    #[test]
+    fn claimed_author_requires_valid_signature_for_this_body() {
+        let key = SecretKey::from([7; 32]);
+        let allowed = vec![author(&key)];
+        assert!(verified_registration(&fixture(0, None, &key), &allowed).is_err());
+        assert!(verified_registration(&fixture(1, Some(0), &key), &allowed).is_err());
+        assert!(verified_registration(&fixture(0, Some(0), &key), &["00".repeat(28)]).is_err());
+        assert!(verified_registration(&fixture(0, Some(0), &key), &allowed).is_ok());
+        assert!(verified_registration("00", &[]).is_err());
+        assert!(verified_registration(&(fixture(0, Some(0), &key) + "00"), &allowed).is_err());
+        let mut tx = hex::decode(fixture(0, Some(0), &key)).unwrap();
+        tx.pop();
+        tx.push(0xa0); // Unbound auxiliary metadata instead of null.
+        assert!(verified_registration(&hex::encode(tx), &allowed)
+            .unwrap_err()
+            .to_string()
+            .contains("auxiliary"));
+    }
+
+    #[tokio::test]
+    async fn registration_is_authenticated_idempotent_and_never_submits() {
+        let key = SecretKey::from([7; 32]);
+        let cfg: Config =
+            toml::from_str(&format!("allowed_authors = [\"{}\"]", author(&key))).unwrap();
+        let store = Arc::new(Store::temporary());
+        // If registration ever tries to submit, this configured node will fail.
+        let node = Arc::new(PortalNode::new("/nonexistent/minos-test.sock".into(), 2));
+        let schema = build(store.clone(), None, Some(node), cfg);
+        let register = |cbor: String, label: &str| {
+            async_graphql::Request::new(
+                "mutation($tx: TransactionInput!) { newTransaction(tx: $tx) { ok } }",
+            )
+            .variables(async_graphql::Variables::from_json(serde_json::json!({
+                "tx": {"label": label, "cborHex": cbor}
+            })))
+        };
+        let bad = schema
+            .execute(register(fixture(0, None, &key), "spoofed"))
+            .await;
+        assert!(!bad.errors.is_empty());
+        assert!(store.get_registered_txs().unwrap().is_empty());
+        for label in ["first", "retry"] {
+            let response = schema
+                .execute(register(fixture(0, Some(0), &key), label))
+                .await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+        }
+        let records = store.get_registered_txs().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].label, "first");
+    }
 }
