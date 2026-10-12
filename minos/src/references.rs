@@ -114,8 +114,31 @@ pub async fn treasury_references(
     treasury: OutRef,
     staking: &[(OutRef, String)],
 ) -> Result<Vec<Utxo>> {
-    let refs: Vec<_> = [registry.clone(), vendor.clone(), treasury.clone()]
+    resolve_references(source, instance, registry, vendor, Some(treasury), staking).await
+}
+
+/// Vendor withdrawals execute only the vendor and configured staking scripts.
+pub async fn withdrawal_references(
+    source: &DataSource,
+    instance: &str,
+    registry: OutRef,
+    vendor: OutRef,
+    staking: &[(OutRef, String)],
+) -> Result<Vec<Utxo>> {
+    resolve_references(source, instance, registry, vendor, None, staking).await
+}
+
+async fn resolve_references(
+    source: &DataSource,
+    instance: &str,
+    registry: OutRef,
+    vendor: OutRef,
+    treasury: Option<OutRef>,
+    staking: &[(OutRef, String)],
+) -> Result<Vec<Utxo>> {
+    let refs: Vec<_> = [registry.clone(), vendor.clone()]
         .into_iter()
+        .chain(treasury.iter().cloned())
         .chain(staking.iter().map(|(r, _)| r.clone()))
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -128,10 +151,10 @@ pub async fn treasury_references(
             .context("resolve reference inputs")?,
     )?;
     let (treasury_hash, vendor_hash) = registry_hashes(&found[&registry], instance)?;
-    for (r, expected) in [(vendor, vendor_hash), (treasury, treasury_hash)]
-        .iter()
-        .chain(staking.iter())
-    {
+    let expected = std::iter::once((vendor, vendor_hash))
+        .chain(treasury.map(|r| (r, treasury_hash)))
+        .collect::<Vec<_>>();
+    for (r, expected) in expected.iter().chain(staking.iter()) {
         let (tag, bytes) =
             script_bytes(&found[r]).with_context(|| format!("reference script {}#{}", r.0, r.1))?;
         ensure!(
@@ -182,6 +205,39 @@ mod tests {
             task,
         )
     }
+    #[tokio::test]
+    async fn withdrawal_references_exclude_treasury_bytes() {
+        let all: Vec<Utxo> =
+            serde_json::from_str(include_str!("../tests/fixtures/withdrawal/utxos.json")).unwrap();
+        let treasury_bytes = script_bytes(all.iter().find(|u| u.tx_hash == TREASURY).unwrap())
+            .unwrap()
+            .1
+            .len() as u64;
+        let response: Vec<serde_json::Value> = serde_json::from_str::<Vec<serde_json::Value>>(
+            include_str!("../tests/fixtures/withdrawal/utxos.json"),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|u| [REGISTRY, VENDOR].contains(&u["tx_hash"].as_str().unwrap()))
+        .collect();
+        let (source, task) = source(serde_json::to_string(&response).unwrap(), 200).await;
+        let outputs = withdrawal_references(
+            &source,
+            INSTANCE,
+            (REGISTRY.into(), 0),
+            (VENDOR.into(), 0),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(
+            total_script_bytes(&outputs).unwrap(),
+            19190 - treasury_bytes
+        );
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn reference_queries_fail_closed_and_verify_registry_script_hashes() {
         let all: Vec<serde_json::Value> =

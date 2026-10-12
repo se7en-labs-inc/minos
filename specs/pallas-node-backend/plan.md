@@ -20,3 +20,22 @@ No new dependency version resolution is needed; preserve the existing pins.
 
 Scope excludes Plutus evaluation, withdrawal contract fixes, portal authorization,
 and general warning cleanup. Those must not be implied by a successful build.
+
+## Review follow-up plan
+
+The exclusions above applied to the initial cleanup; the user has now authorized
+these integration fixes and withdrawal preflight. Continue in the existing spec.
+Expose reusable guarded query sessions from minos, with bounded operations and
+cleanup, and replace the portal backend with a conversion adapter. Verify vkey
+witnesses with pinned Pallas crypto. Make newTransaction a registration-only
+mutation and use an atomic body-hash insert to preserve the original record.
+Centralize strict reference-script resolution and validation. Use the pinned
+uplc evaluator via CBOR to bridge its older Pallas types; preserve resolved output
+CBOR and fail closed on unsupported evaluation data. Evaluate the final withdrawal
+against fetched protocol parameters without requiring signing keys. Add tests at
+these integration boundaries and document precisely what preflight does not prove.
+
+Remove treasury reference fields from WithdrawParams and withdrawal CLI discovery.
+Share strict reference resolution with an optional treasury reference internally;
+retain the existing treasury resolver for other workflows. Test the withdrawal
+builder and preflight with public fixtures; leave UPLC phase-one checks enabled.

@@ -263,7 +263,9 @@ impl ProtocolParams {
             .iter()
             .map(|(k, v)| Some((k.as_str(), v.as_i64()?)))
             .collect::<Option<_>>()?;
-        if pairs.is_empty() { return None; }
+        if pairs.is_empty() {
+            return None;
+        }
         pairs.sort_unstable_by_key(|(k, _)| *k);
         Some(pairs.into_iter().map(|(_, v)| v).collect())
     }

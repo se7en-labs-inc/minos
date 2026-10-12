@@ -31,8 +31,6 @@ pub struct WithdrawParams {
     pub registry_utxo_index: u64,
     pub vendor_script_ref_hash: String,
     pub vendor_script_ref_index: u64,
-    pub treasury_script_ref_hash: String,
-    pub treasury_script_ref_index: u64,
 
     // Required signers (vendor multisig key hashes)
     pub vendor_key_hashes: Vec<Vec<u8>>,
@@ -125,15 +123,6 @@ pub fn build(params: WithdrawParams) -> Result<UnsignedTx> {
         params.vendor_script_ref_index,
     );
 
-    let treasury_ref_hash_bytes: [u8; 32] = hex::decode(&params.treasury_script_ref_hash)
-        .context("treasury script ref hash")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("treasury script ref hash must be 32 bytes"))?;
-    let treasury_ref_input = Input::new(
-        Hash::from(treasury_ref_hash_bytes),
-        params.treasury_script_ref_index,
-    );
-
     // -----------------------------------------------------------------------
     // 5. Build destination output (matured funds)
     // -----------------------------------------------------------------------
@@ -204,7 +193,7 @@ pub fn build(params: WithdrawParams) -> Result<UnsignedTx> {
     // 10. Build staging transaction
     // -----------------------------------------------------------------------
     // Deduplicate reference inputs (registry and vendor_ref may be the same UTxO)
-    let mut ref_inputs = vec![registry_ref_input, treasury_ref_input];
+    let mut ref_inputs = vec![registry_ref_input];
     if params.vendor_script_ref_hash != params.registry_utxo_hash
         || params.vendor_script_ref_index != params.registry_utxo_index
     {

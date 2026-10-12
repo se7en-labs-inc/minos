@@ -95,6 +95,11 @@ enum WalletCmd {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Evaluate an unsigned withdrawal locally without signing or submitting
+    Preflight {
+        #[arg(long)]
+        tx: PathBuf,
+    },
     /// List treasury instances known to the portal
     Instances,
 
@@ -464,13 +469,29 @@ async fn main() -> Result<()> {
         let magic = cli
             .testnet_magic
             .unwrap_or_else(|| cli.network.testnet_magic());
-        DataSource::Node(node::LocalNode::new(socket, u64::from(magic))
-            .with_timeout(std::time::Duration::from_secs(cli.node_timeout_secs)))
+        DataSource::Node(
+            node::LocalNode::new(socket, u64::from(magic))
+                .with_timeout(std::time::Duration::from_secs(cli.node_timeout_secs)),
+        )
     } else {
         DataSource::Koios(Koios::new(cli.network.koios_base_url(), cli.koios_key))
     };
 
     match cli.command {
+        Commands::Preflight { tx } => {
+            let cbor = read_cbor_hex(&tx)?;
+            let proto = ds.protocol_params().await?;
+            let report = minos::preflight::withdrawal(
+                &ds,
+                &cbor,
+                &proto,
+                cli.network.genesis_offset_secs(),
+                &[],
+            )
+            .await?;
+            println!("Withdrawal preflight passed: {} redeemers, {} memory, {} steps. This is not full ledger validation.", report.redeemers, report.memory, report.steps);
+            Ok(())
+        }
         Commands::Instances => cmd_instances(&portal).await,
         Commands::Status { instance } => cmd_status(&portal, &instance).await,
         Commands::Complete {
@@ -1213,8 +1234,6 @@ async fn cmd_withdraw(
         registry_utxo_index: u64,
         vendor_script_ref_hash: String,
         vendor_script_ref_index: u64,
-        treasury_script_ref_hash: String,
-        treasury_script_ref_index: u64,
     }
     // Parse --registry-utxo override (format: "<txhash>#<index>")
     let registry_utxo_override: Option<(String, u64)> = registry_utxo
@@ -1238,8 +1257,6 @@ async fn cmd_withdraw(
             registry_utxo_index: reg_idx,
             vendor_script_ref_hash: pub_tx.to_string(),
             vendor_script_ref_index: 2,
-            treasury_script_ref_hash: pub_tx.to_string(),
-            treasury_script_ref_index: 1,
         }
     } else {
         let vendor_ref = inst
@@ -1248,12 +1265,6 @@ async fn cmd_withdraw(
             .script_reference
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("vendor script has no scriptReference"))?;
-        let treasury_ref = inst
-            .registry
-            .treasury_script
-            .script_reference
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("treasury script has no scriptReference"))?;
         let (reg_hash, reg_idx) = registry_utxo_override
             .clone()
             .unwrap_or_else(|| (vendor_ref.transaction.clone(), 0));
@@ -1262,8 +1273,6 @@ async fn cmd_withdraw(
             registry_utxo_index: reg_idx,
             vendor_script_ref_hash: vendor_ref.transaction.clone(),
             vendor_script_ref_index: vendor_ref.index,
-            treasury_script_ref_hash: treasury_ref.transaction.clone(),
-            treasury_script_ref_index: treasury_ref.index,
         }
     };
 
@@ -1273,7 +1282,7 @@ async fn cmd_withdraw(
         .cloned()
         .zip(staking_script_hashes.iter().map(hex::encode))
         .collect();
-    let ref_utxos = references::treasury_references(
+    let ref_utxos = references::withdrawal_references(
         koios,
         instance,
         (
@@ -1283,10 +1292,6 @@ async fn cmd_withdraw(
         (
             ref_info.vendor_script_ref_hash.clone(),
             ref_info.vendor_script_ref_index,
-        ),
-        (
-            ref_info.treasury_script_ref_hash.clone(),
-            ref_info.treasury_script_ref_index,
         ),
         &staking_expected,
     )
@@ -1320,8 +1325,6 @@ async fn cmd_withdraw(
         registry_utxo_index: ref_info.registry_utxo_index,
         vendor_script_ref_hash: ref_info.vendor_script_ref_hash,
         vendor_script_ref_index: ref_info.vendor_script_ref_index,
-        treasury_script_ref_hash: ref_info.treasury_script_ref_hash,
-        treasury_script_ref_index: ref_info.treasury_script_ref_index,
         vendor_key_hashes,
         fee_inputs: selected.iter().map(|u| (*u).clone()).collect(),
         collateral: collateral.clone(),
@@ -1360,6 +1363,19 @@ async fn cmd_withdraw(
     eprintln!("tx fee: {:.4} ADA", params.fee as f64 / 1_000_000.0);
 
     let unsigned_tx = tx::withdraw::build(params)?;
+    let report = minos::preflight::withdrawal(
+        koios,
+        &unsigned_tx.cbor_hex,
+        &proto,
+        genesis_offset_secs,
+        &ref_utxos,
+    )
+    .await
+    .context("withdrawal preflight failed; unsigned file was not written")?;
+    eprintln!(
+        "Withdrawal preflight passed: {} redeemers, {} memory, {} steps",
+        report.redeemers, report.memory, report.steps
+    );
     write_tx(unsigned_tx, out)
 }
 

@@ -2,6 +2,7 @@ pub mod coin_select;
 pub mod koios;
 pub mod node;
 pub mod portal;
+pub mod preflight;
 pub mod references;
 pub mod scripts;
 pub mod tx;
