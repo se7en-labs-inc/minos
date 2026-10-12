@@ -14,7 +14,8 @@ use pallas_network::{
     multiplexer::Bearer,
 };
 use pallas_traverse::wellknown::GenesisValues;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, time::Duration};
+use tokio::time::timeout;
 
 use crate::koios::{AssetListItem, Koios, ProtocolParams, Tip, Utxo};
 
@@ -45,9 +46,7 @@ impl DataSource {
     pub async fn asset_utxos(&self, policy_id: &str, asset_name: &str) -> Result<Vec<Utxo>> {
         match self {
             Self::Koios(k) => k.asset_utxos(policy_id, asset_name).await,
-            Self::Node(_) => anyhow::bail!(
-                "asset-by-policy discovery is not supported by filtered node queries; supply explicit reference UTxOs or use Koios"
-            ),
+            Self::Node(_) => anyhow::bail!("asset-by-policy discovery is not supported by filtered node queries; supply explicit reference UTxOs or use Koios"),
         }
     }
     pub async fn utxo_info(&self, refs: &[(String, u64)]) -> Result<Vec<Utxo>> {
@@ -64,9 +63,18 @@ impl DataSource {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum SubmissionError {
+    #[error("transaction {hash} rejected: {reason}")]
+    Rejected { hash: String, reason: String },
+    #[error("submission outcome unknown for transaction {hash}: {reason}; check its status before retrying")]
+    Unknown { hash: String, reason: String },
+}
+
 pub struct LocalNode {
     socket_path: String,
     network_magic: u64,
+    operation_timeout: Duration,
 }
 
 impl LocalNode {
@@ -74,118 +82,93 @@ impl LocalNode {
         Self {
             socket_path,
             network_magic,
+            operation_timeout: Duration::from_secs(30),
         }
+    }
+
+    pub fn with_timeout(mut self, duration: Duration) -> Self {
+        self.operation_timeout = duration;
+        self
     }
 
     pub async fn tip(&self) -> Result<Tip> {
-        let genesis = GenesisValues::from_magic(self.network_magic)
-            .context("unknown network magic: no slot/time mapping available")?;
-        let mut session = self.session().await?;
-        let result = async {
-            let point = q::get_chain_point(session.query())
-                .await
-                .context("query chain point")?;
-            let Point::Specific(abs_slot, _) = point else {
-                anyhow::bail!("node is at origin; no chain tip available");
-            };
-            let block = q::get_chain_block_no(session.query())
-                .await
-                .context("query block number")?;
-            Ok(Tip {
-                block_no: u64::from(block.block_number),
-                abs_slot,
-                block_time: genesis.slot_to_wallclock(abs_slot),
-            })
-        }
-        .await;
-        session.finish(result).await
+        let mut s = self.session().await?;
+        let result = s.tip().await;
+        s.finish(result).await
     }
-
     pub async fn protocol_params(&self) -> Result<ProtocolParams> {
-        let mut session = self.session().await?;
-        let result = async {
-            ensure!(
-                session.era == 6,
-                "protocol parameters require Conway (node era {})",
-                session.era
-            );
-            let era = session.era;
-            let params = q::get_current_pparams(session.query(), era)
-                .await
-                .context("query protocol parameters")?;
-            protocol_params(params)
-        }
-        .await;
-        session.finish(result).await
+        let mut s = self.session().await?;
+        let result = s.protocol_params().await;
+        s.finish(result).await
     }
-
     pub async fn address_utxos(&self, bech32: &str) -> Result<Vec<Utxo>> {
-        let address = Address::from_bech32(bech32).context("invalid query address")?;
-        let mut session = self.session().await?;
-        let era = session.era;
-        let result = q::get_utxo_by_address(session.query(), era, vec![address.to_vec().into()])
-            .await
-            .context("query address UTxOs")
-            .and_then(decode_utxos);
-        session.finish(result).await
+        Address::from_bech32(bech32).context("invalid query address")?;
+        let mut s = self.session().await?;
+        let result = s.address_utxos(bech32).await;
+        s.finish(result).await
     }
-
     pub async fn utxo_info(&self, refs: &[(String, u64)]) -> Result<Vec<Utxo>> {
-        let inputs = parse_refs(refs)?;
-        if inputs.is_empty() {
+        if parse_refs(refs)?.is_empty() {
             return Ok(vec![]);
         }
-        let mut session = self.session().await?;
-        let era = session.era;
-        let result = q::get_utxo_by_txin(session.query(), era, inputs)
-            .await
-            .context("query UTxO references")
-            .and_then(decode_utxos);
-        session.finish(result).await
+        let mut s = self.session().await?;
+        let result = s.utxo_info(refs).await;
+        s.finish(result).await
     }
-
     pub async fn submit_tx(&self, cbor_hex: &str) -> Result<String> {
         let bytes = hex::decode(cbor_hex).context("invalid transaction hex")?;
         let tx: pallas_primitives::conway::Tx =
             minicbor::decode(&bytes).context("invalid Conway transaction CBOR")?;
         let hash = Hasher::<256>::hash(tx.transaction_body.raw_cbor()).to_string();
-        let mut session = self.session().await?;
+        let mut s = self.session().await?;
         let result = async {
             ensure!(
-                session.era == 6,
+                s.era == 6,
                 "submission requires Conway (node era {})",
-                session.era
+                s.era
             );
-            let response = session
-                .client()
-                .submission()
-                .submit_tx(EraTx(6, bytes))
-                .await
-                .context("local transaction submission")?;
-            // Do not turn a known acceptance/rejection into an ambiguous result
-            // merely because protocol termination fails after the response.
-            let _ = session.client().submission().terminate_gracefully().await;
+            let response = timeout(
+                s.operation_timeout,
+                s.client()?.submission().submit_tx(EraTx(6, bytes)),
+            )
+            .await;
             match response {
-                Response::Accepted => Ok(hash),
-                Response::Rejected(err) => anyhow::bail!("transaction rejected: {err:?}"),
+                Ok(Ok(Response::Accepted)) => Ok(hash.clone()),
+                Ok(Ok(Response::Rejected(err))) => Err(SubmissionError::Rejected {
+                    hash: hash.clone(),
+                    reason: format!("{err:?}"),
+                }
+                .into()),
+                other => Err(SubmissionError::Unknown {
+                    hash: hash.clone(),
+                    reason: format!("{other:?}"),
+                }
+                .into()),
             }
         }
         .await;
-        session.finish(result).await
+        // Cleanup is bounded and cannot replace a known acceptance or rejection.
+        s.finish(result).await
     }
 
-    async fn session(&self) -> Result<NodeSession> {
-        let bearer = Bearer::connect_unix(&self.socket_path)
-            .await
-            .with_context(|| format!("connect to node socket {}", self.socket_path))?;
-        // Own the plexer before handshake/acquire so errors also clean it up.
-        let mut session = NodeSession {
+    pub async fn session(&self) -> Result<NodeSession> {
+        let bearer = timeout(
+            self.operation_timeout,
+            Bearer::connect_unix(&self.socket_path),
+        )
+        .await
+        .context("node connection timed out")?
+        .with_context(|| format!("connect to node socket {}", self.socket_path))?;
+        let mut s = NodeSession {
             client: Some(NodeClient::new(bearer)),
             era: 0,
+            network_magic: self.network_magic,
+            operation_timeout: self.operation_timeout,
+            runtime: tokio::runtime::Handle::current(),
         };
-        let result = async {
-            let confirmation = session
-                .client()
+        let result = timeout(self.operation_timeout, async {
+            let confirmation = s
+                .client()?
                 .handshake()
                 .handshake(n2c::VersionTable::v10_and_above(self.network_magic))
                 .await
@@ -194,63 +177,163 @@ impl LocalNode {
                 matches!(confirmation, Confirmation::Accepted(..)),
                 "node handshake refused: {confirmation:?}"
             );
-            session
-                .query()
+            s.query()?
                 .acquire(None)
                 .await
                 .context("acquire node ledger state")?;
-            session.era = q::get_current_era(session.query())
+            s.era = q::get_current_era(s.query()?)
                 .await
                 .context("query current era")?;
             Ok(())
-        }
-        .await;
+        })
+        .await
+        .context("node session setup timed out")
+        .and_then(|r| r);
         match result {
-            Ok(()) => Ok(session),
-            Err(err) => session.finish(Err(err)).await,
+            Ok(()) => Ok(s),
+            Err(err) => s.finish(Err(err)).await,
         }
     }
 }
 
-struct NodeSession {
+/// Shared acquired ledger snapshot. Any protocol error invalidates the session.
+/// Dropping or cancelling a session schedules multiplexer cancellation.
+pub struct NodeSession {
     client: Option<NodeClient>,
     era: u16,
+    network_magic: u64,
+    operation_timeout: Duration,
+    runtime: tokio::runtime::Handle,
 }
-
 impl NodeSession {
-    fn client(&mut self) -> &mut NodeClient {
+    fn client(&mut self) -> Result<&mut NodeClient> {
         self.client
             .as_mut()
-            .expect("session client exists until finish")
+            .context("node session closed after an earlier failure")
     }
-    fn query(&mut self) -> &mut localstate::Client {
-        self.client().statequery()
+    fn query(&mut self) -> Result<&mut localstate::Client> {
+        Ok(self.client()?.statequery())
     }
 
+    async fn checked<T>(&mut self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            if let Some(client) = self.client.take() {
+                client.abort().await;
+            }
+        }
+        result
+    }
+    pub async fn tip(&mut self) -> Result<Tip> {
+        let result = timeout(self.operation_timeout, async {
+            let genesis = GenesisValues::from_magic(self.network_magic)
+                .context("unknown network magic: no slot/time mapping available")?;
+            let point = q::get_chain_point(self.query()?)
+                .await
+                .context("query chain point")?;
+            let Point::Specific(abs_slot, _) = point else {
+                anyhow::bail!("node is at origin; no chain tip available");
+            };
+            let block = q::get_chain_block_no(self.query()?)
+                .await
+                .context("query block number")?;
+            Ok(Tip {
+                block_no: u64::from(block.block_number),
+                abs_slot,
+                block_time: genesis.slot_to_wallclock(abs_slot),
+            })
+        })
+        .await
+        .context("node tip query timed out")
+        .and_then(|r| r);
+        self.checked(result).await
+    }
+    pub async fn protocol_params(&mut self) -> Result<ProtocolParams> {
+        let result = timeout(self.operation_timeout, async {
+            ensure!(
+                self.era == 6,
+                "protocol parameters require Conway (node era {})",
+                self.era
+            );
+            let era = self.era;
+            protocol_params(
+                q::get_current_pparams(self.query()?, era)
+                    .await
+                    .context("query protocol parameters")?,
+            )
+        })
+        .await
+        .context("node protocol parameter query timed out")
+        .and_then(|r| r);
+        self.checked(result).await
+    }
+    pub async fn address_utxos(&mut self, bech32: &str) -> Result<Vec<Utxo>> {
+        let address = Address::from_bech32(bech32).context("invalid query address")?;
+        let era = self.era;
+        let result = timeout(self.operation_timeout, async {
+            decode_utxos(
+                q::get_utxo_by_address(self.query()?, era, vec![address.to_vec().into()])
+                    .await
+                    .context("query address UTxOs")?,
+            )
+        })
+        .await
+        .context("node address query timed out")
+        .and_then(|r| r);
+        self.checked(result).await
+    }
+    pub async fn utxo_info(&mut self, refs: &[(String, u64)]) -> Result<Vec<Utxo>> {
+        let inputs = parse_refs(refs)?;
+        if inputs.is_empty() {
+            return Ok(vec![]);
+        }
+        let era = self.era;
+        let result = timeout(self.operation_timeout, async {
+            decode_utxos(
+                q::get_utxo_by_txin(self.query()?, era, inputs)
+                    .await
+                    .context("query UTxO references")?,
+            )
+        })
+        .await
+        .context("node reference query timed out")
+        .and_then(|r| r);
+        self.checked(result).await
+    }
+    pub async fn close(self) {
+        self.finish(Ok(())).await.ok();
+    }
     async fn finish<T>(mut self, result: Result<T>) -> Result<T> {
-        let client = self.client.as_mut().expect("active session");
-        if matches!(client.statequery().state(), localstate::State::Acquired) {
-            let _ = client.statequery().send_release().await;
+        // Pallas queues these messages; abort is still required to stop its tasks.
+        let cleanup = async {
+            if let Some(client) = self.client.as_mut() {
+                if matches!(
+                    client.submission().state(),
+                    pallas_network::miniprotocols::localtxsubmission::State::Idle
+                ) {
+                    let _ = client.submission().terminate_gracefully().await;
+                }
+                if matches!(client.statequery().state(), localstate::State::Acquired) {
+                    let _ = client.statequery().send_release().await;
+                }
+                if matches!(client.statequery().state(), localstate::State::Idle) {
+                    let _ = client.statequery().send_done().await;
+                }
+            }
+        };
+        let _ = timeout(Duration::from_secs(1), cleanup).await;
+        if let Some(client) = self.client.take() {
+            client.abort().await;
         }
-        if matches!(client.statequery().state(), localstate::State::Idle) {
-            let _ = client.statequery().send_done().await;
-        }
-        self.client.take().expect("active session").abort().await;
         result
     }
 }
-
 impl Drop for NodeSession {
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
-            // Cancellation must tear down Pallas's spawned multiplexer tasks.
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(client.abort());
-            }
+            self.runtime.spawn(client.abort());
         }
     }
 }
-
 fn parse_refs(refs: &[(String, u64)]) -> Result<BTreeSet<q::TransactionInput>> {
     refs.iter()
         .map(|(hash, index)| {
@@ -275,6 +358,11 @@ fn rational(value: &q::RationalNumber) -> Result<f64> {
 }
 
 fn protocol_params(p: q::ProtocolParam) -> Result<ProtocolParams> {
+    let (major, _) = p.protocol_version.context("missing protocol version")?;
+    let max_ex = p
+        .max_tx_ex_units
+        .as_ref()
+        .context("missing transaction execution limits")?;
     let prices = p.execution_costs.context("missing execution prices")?;
     let models = p
         .cost_models_for_script_languages
@@ -303,7 +391,8 @@ fn protocol_params(p: q::ProtocolParam) -> Result<ProtocolParams> {
         rational(&prices.mem_price)?,
         rational(&prices.step_price)?,
         ref_price,
-    ))
+    )
+    .with_evaluation_limits(major, max_ex.mem, max_ex.steps))
 }
 
 fn uint(n: &AnyUInt) -> u64 {
@@ -375,6 +464,8 @@ fn decode_utxos(map: q::UTxOByAddress) -> Result<Vec<Utxo>> {
                 asset_list: Some(assets),
                 inline_datum,
                 reference_script,
+                datum_hash: None,
+                output_cbor: Some(minicbor::to_vec(output).context("encode resolved output")?),
             })
         })
         .collect()

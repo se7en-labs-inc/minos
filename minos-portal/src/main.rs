@@ -45,7 +45,10 @@ async fn main() -> Result<()> {
 
     let portal_node = cfg.node_socket_path.as_ref().map(|sock| {
         info!("Using node socket: {} (magic {})", sock, cfg.network_magic);
-        Arc::new(node::PortalNode::new(sock.clone(), cfg.network_magic))
+        Arc::new(
+            node::PortalNode::new(sock.clone(), cfg.network_magic)
+                .with_timeout(std::time::Duration::from_secs(cfg.node_timeout_secs)),
+        )
     });
 
     let koios = cfg.koios_url.as_deref().map(|url| {

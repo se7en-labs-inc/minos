@@ -17,6 +17,10 @@ pub struct Config {
     #[serde(default = "default_network_magic")]
     pub network_magic: u64,
 
+    /// Deadline for each node connection or query, in seconds.
+    #[serde(default = "default_node_timeout")]
+    pub node_timeout_secs: u64,
+
     /// Koios base URL. Optional — used for one-time publish-tx bootstrap
     /// (resolving tx hash → block slot for chain-sync start point).
     pub koios_url: Option<String>,
@@ -41,7 +45,12 @@ impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
-        toml::from_str(&text).context("parsing config toml")
+        let config: Self = toml::from_str(&text).context("parsing config toml")?;
+        anyhow::ensure!(
+            config.node_timeout_secs > 0,
+            "node_timeout_secs must be positive"
+        );
+        Ok(config)
     }
 
     /// Derive Cardano network name from magic or Koios URL.
@@ -79,4 +88,8 @@ fn default_poll_interval() -> u64 {
 }
 fn default_network_magic() -> u64 {
     2
+}
+
+fn default_node_timeout() -> u64 {
+    30
 }

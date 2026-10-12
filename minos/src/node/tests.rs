@@ -150,6 +150,11 @@ fn pparams() -> q::ProtocolParam {
     p.max_transaction_size = Some(16384);
     p.collateral_percentage = Some(150);
     p.max_collateral_inputs = Some(3);
+    p.protocol_version = Some((10, 0));
+    p.max_tx_ex_units = Some(q::ExUnits {
+        mem: 14_000_000,
+        steps: 10_000_000_000,
+    });
     p.cost_models_for_script_languages = Some(q::CostModels {
         plutus_v1: None,
         plutus_v2: None,
@@ -498,4 +503,108 @@ async fn submission_preserves_body_hash_and_node_rejections() {
         }
         joined(server).await;
     }
+}
+
+#[tokio::test]
+async fn stalled_handshake_times_out_and_closes_socket() {
+    use tokio::io::AsyncReadExt;
+    let (_socket, listener, node) = socket();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut handshake_bytes = Vec::new();
+        timeout(
+            Duration::from_secs(3),
+            stream.read_to_end(&mut handshake_bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    });
+    let err = node
+        .with_timeout(Duration::from_millis(50))
+        .tip()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("timed out"));
+    joined(server).await;
+}
+
+#[tokio::test]
+async fn stalled_queries_invalidate_shared_sessions_and_disconnect() {
+    for _ in 0..3 {
+        let (_socket, listener, node) = socket();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut s = acquired(listener).await;
+            assert_eq!(request(&mut s).await, q::Request::GetChainPoint);
+            done_rx.await.unwrap();
+            if s.statequery()
+                .send_result(AnyCbor::from_encode(Point::Origin))
+                .await
+                .is_ok()
+            {
+                disconnected(s).await;
+            } else {
+                s.abort().await;
+            }
+        });
+        let node = node.with_timeout(Duration::from_millis(200));
+        let mut session = node.session().await.unwrap();
+        assert!(session
+            .tip()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("timed out"));
+        assert!(session
+            .tip()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("closed"));
+        done_tx.send(()).unwrap();
+        session.close().await;
+        joined(server).await;
+    }
+}
+
+#[tokio::test]
+async fn submission_response_timeout_reports_unknown_hash_without_retry() {
+    let cbor = "84a3008001800200a0f5f6";
+    let (_socket, listener, node) = socket();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut s = acquired(listener).await;
+        assert!(matches!(
+            s.localtxsubmission().recv_next_request().await.unwrap(),
+            localtxsubmission::Request::Submit(_)
+        ));
+        done_rx.await.unwrap();
+        disconnected(s).await;
+    });
+    let err = node
+        .with_timeout(Duration::from_millis(200))
+        .submit_tx(cbor)
+        .await
+        .unwrap_err();
+    match err.downcast_ref::<SubmissionError>().unwrap() {
+        SubmissionError::Unknown { hash, .. } => assert_eq!(
+            hash,
+            &Hasher::<256>::hash(&hex::decode("a3008001800200").unwrap()).to_string()
+        ),
+        _ => panic!("a missing response is not a rejection"),
+    }
+    done_tx.send(()).unwrap();
+    joined(server).await;
+}
+
+#[tokio::test]
+async fn session_dropped_outside_runtime_still_disconnects() {
+    let (_socket, listener, node) = socket();
+    let server = tokio::spawn(async move {
+        disconnected(acquired(listener).await).await;
+    });
+    let session = node.session().await.unwrap();
+    std::thread::spawn(move || drop(session)).join().unwrap();
+    joined(server).await;
 }

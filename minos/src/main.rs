@@ -42,6 +42,10 @@ struct Cli {
     #[arg(long, global = true)]
     testnet_magic: Option<u32>,
 
+    /// Deadline for each node connection or query, in seconds
+    #[arg(long, default_value = "30", global = true, value_parser = clap::value_parser!(u64).range(1..))]
+    node_timeout_secs: u64,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -453,6 +457,8 @@ enum MafCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    anyhow::ensure!(cli.testnet_magic.is_none_or(|m| m == cli.network.testnet_magic()),
+        "--testnet-magic conflicts with --network; network timing and addresses must agree");
     let portal_url = cli
         .portal
         .as_deref()
@@ -463,7 +469,8 @@ async fn main() -> Result<()> {
         let magic = cli
             .testnet_magic
             .unwrap_or_else(|| cli.network.testnet_magic());
-        DataSource::Node(node::LocalNode::new(socket, u64::from(magic)))
+        DataSource::Node(node::LocalNode::new(socket, u64::from(magic))
+            .with_timeout(std::time::Duration::from_secs(cli.node_timeout_secs)))
     } else {
         DataSource::Koios(Koios::new(cli.network.koios_base_url(), cli.koios_key))
     };

@@ -13,7 +13,10 @@ pub struct Koios {
 impl Koios {
     pub fn new(base_url: &str, api_key: Option<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("HTTP client configuration"),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
         }
@@ -42,6 +45,7 @@ impl Koios {
             .request("/tip")
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await
             .context("tip parse")?;
@@ -51,9 +55,10 @@ impl Koios {
     pub async fn protocol_params(&self) -> Result<ProtocolParams> {
         let resp: Vec<ProtocolParams> = self
             .request("/epoch_params")
-            .query(&[("limit", "1")])
+            .query(&[("limit", "1"), ("order", "epoch_no.desc")])
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await
             .context("protocol_params parse")?;
@@ -71,6 +76,7 @@ impl Koios {
             )
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await
             .context("asset_utxos parse")?;
@@ -84,6 +90,7 @@ impl Koios {
             .json(&serde_json::json!({ "_addresses": [address], "_extended": true }))
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await
             .context("address_utxos parse")?;
@@ -102,6 +109,7 @@ impl Koios {
             .json(&serde_json::json!({ "_utxo_refs": refs, "_extended": true }))
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await
             .context("utxo_info parse")?;
@@ -154,6 +162,34 @@ pub struct ProtocolParams {
 }
 
 impl ProtocolParams {
+    pub fn evaluation_limits(&self) -> Result<(u16, u64, u64)> {
+        let integer = |name: &str| {
+            self._extra[name]
+                .as_u64()
+                .or_else(|| self._extra[name].as_str().and_then(|s| s.parse().ok()))
+                .with_context(|| format!("missing or invalid protocol parameter {name}"))
+        };
+        let major =
+            u16::try_from(integer("protocol_major")?).context("invalid protocol major version")?;
+        anyhow::ensure!(
+            (9..=11).contains(&major),
+            "preflight supports protocol major versions 9 through 11, got {major}"
+        );
+        let mem = integer("max_tx_ex_mem")?;
+        let steps = integer("max_tx_ex_steps")?;
+        anyhow::ensure!(
+            mem > 0 && steps > 0 && mem <= i64::MAX as u64 && steps <= i64::MAX as u64,
+            "invalid transaction execution limits"
+        );
+        Ok((major, mem, steps))
+    }
+
+    pub fn with_evaluation_limits(mut self, major: u64, mem: u64, steps: u64) -> Self {
+        self._extra["protocol_major"] = major.into();
+        self._extra["max_tx_ex_mem"] = mem.into();
+        self._extra["max_tx_ex_steps"] = steps.into();
+        self
+    }
     /// Construct from typed protocol parameters queried through Pallas.
     #[allow(clippy::too_many_arguments)]
     pub fn from_fields(
@@ -215,10 +251,7 @@ impl ProtocolParams {
         let v3 = models.get("PlutusV3").or_else(|| models.get("plutusv3"))?;
         if let Some(arr) = v3.as_array() {
             // Array form: canonical ordering preserved
-            let vals: Vec<i64> = arr
-                .iter()
-                .filter_map(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
-                .collect();
+            let vals: Vec<i64> = arr.iter().map(|v| v.as_i64()).collect::<Option<_>>()?;
             if vals.is_empty() {
                 return None;
             }
@@ -228,11 +261,9 @@ impl ProtocolParams {
         let obj = v3.as_object()?;
         let mut pairs: Vec<(&str, i64)> = obj
             .iter()
-            .filter_map(|(k, v)| {
-                let n = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))?;
-                Some((k.as_str(), n))
-            })
-            .collect();
+            .map(|(k, v)| Some((k.as_str(), v.as_i64()?)))
+            .collect::<Option<_>>()?;
+        if pairs.is_empty() { return None; }
         pairs.sort_unstable_by_key(|(k, _)| *k);
         Some(pairs.into_iter().map(|(_, v)| v).collect())
     }
@@ -249,6 +280,10 @@ pub struct Utxo {
     pub inline_datum: Option<serde_json::Value>,
     /// Reference script info (Koios extended format: {bytes: "<hex>", ...})
     pub reference_script: Option<serde_json::Value>,
+    pub datum_hash: Option<String>,
+    /// Ledger output retained by the node adapter for evaluation.
+    #[serde(skip)]
+    pub output_cbor: Option<Vec<u8>>,
 }
 
 impl Utxo {
