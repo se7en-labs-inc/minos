@@ -1,14 +1,6 @@
-mod coin_select;
 mod config;
-mod koios;
 mod maf;
-mod node;
-mod portal;
-mod scripts;
-mod tx;
-mod types;
-mod uplc;
-mod wallet;
+use minos::{coin_select, koios, node, portal, references, tx, types, wallet};
 
 use std::path::PathBuf;
 
@@ -457,8 +449,11 @@ enum MafCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    anyhow::ensure!(cli.testnet_magic.is_none_or(|m| m == cli.network.testnet_magic()),
-        "--testnet-magic conflicts with --network; network timing and addresses must agree");
+    anyhow::ensure!(
+        cli.testnet_magic
+            .is_none_or(|m| m == cli.network.testnet_magic()),
+        "--testnet-magic conflicts with --network; network timing and addresses must agree"
+    );
     let portal_url = cli
         .portal
         .as_deref()
@@ -925,17 +920,19 @@ async fn cmd_complete(
         network_id,
     };
     // Fetch ref script sizes for accurate fee calculation
-    let ref_utxos = koios
-        .utxo_info(&[
-            (vendor_ref.transaction.clone(), vendor_ref.index),
-            (treasury_ref.transaction.clone(), treasury_ref.index),
-        ])
-        .await
-        .unwrap_or_default();
-    let ref_script_bytes: u64 = ref_utxos
-        .iter()
-        .map(|u| u.reference_script_size() as u64)
-        .sum();
+    let ref_utxos = references::treasury_references(
+        koios,
+        instance,
+        (
+            params.registry_utxo_hash.clone(),
+            params.registry_utxo_index,
+        ),
+        (vendor_ref.transaction.clone(), vendor_ref.index),
+        (treasury_ref.transaction.clone(), treasury_ref.index),
+        &[],
+    )
+    .await?;
+    let ref_script_bytes = references::total_script_bytes(&ref_utxos)?;
     eprintln!("ref script bytes: {ref_script_bytes}");
 
     let draft = tx::complete::build(params.clone())?;
@@ -1271,7 +1268,18 @@ async fn cmd_withdraw(
     };
 
     // 7. Fetch ref script sizes for accurate fee calculation
-    let mut ref_utxo_refs: Vec<(String, u64)> = vec![
+    let staking_expected: Vec<_> = staking_script_refs
+        .iter()
+        .cloned()
+        .zip(staking_script_hashes.iter().map(hex::encode))
+        .collect();
+    let ref_utxos = references::treasury_references(
+        koios,
+        instance,
+        (
+            ref_info.registry_utxo_hash.clone(),
+            ref_info.registry_utxo_index,
+        ),
         (
             ref_info.vendor_script_ref_hash.clone(),
             ref_info.vendor_script_ref_index,
@@ -1280,13 +1288,10 @@ async fn cmd_withdraw(
             ref_info.treasury_script_ref_hash.clone(),
             ref_info.treasury_script_ref_index,
         ),
-    ];
-    ref_utxo_refs.extend(staking_script_refs.iter().cloned());
-    let ref_utxos = koios.utxo_info(&ref_utxo_refs).await.unwrap_or_default();
-    let ref_script_bytes: u64 = ref_utxos
-        .iter()
-        .map(|u| u.reference_script_size() as u64)
-        .sum();
+        &staking_expected,
+    )
+    .await?;
+    let ref_script_bytes = references::total_script_bytes(&ref_utxos)?;
     eprintln!("ref script bytes: {ref_script_bytes}");
 
     // 8. Coin selection
@@ -1606,23 +1611,22 @@ async fn cmd_adjudicate(
     let collateral = coin_select::select_collateral(&wallet_utxos, &fee_input_hashes)?;
 
     // Fetch ref script sizes before ref_info fields are moved into params
-    let ref_utxos = koios
-        .utxo_info(&[
-            (
-                ref_info.vendor_script_hash.clone(),
-                ref_info.vendor_script_index,
-            ),
-            (
-                ref_info.treasury_script_hash.clone(),
-                ref_info.treasury_script_index,
-            ),
-        ])
-        .await
-        .unwrap_or_default();
-    let ref_script_bytes: u64 = ref_utxos
-        .iter()
-        .map(|u| u.reference_script_size() as u64)
-        .sum();
+    let ref_utxos = references::treasury_references(
+        koios,
+        instance,
+        (ref_info.registry_hash.clone(), ref_info.registry_index),
+        (
+            ref_info.vendor_script_hash.clone(),
+            ref_info.vendor_script_index,
+        ),
+        (
+            ref_info.treasury_script_hash.clone(),
+            ref_info.treasury_script_index,
+        ),
+        &[],
+    )
+    .await?;
+    let ref_script_bytes = references::total_script_bytes(&ref_utxos)?;
 
     let mut params = tx::adjudicate::AdjudicateParams {
         vendor_utxo_hash: vendor_info.utxo_hash,
@@ -1937,23 +1941,22 @@ async fn cmd_modify(
     let collateral = coin_select::select_collateral(&wallet_utxos, &fee_input_hashes)?;
 
     // Fetch ref script sizes before ref_info fields are moved into params
-    let ref_utxos = koios
-        .utxo_info(&[
-            (
-                ref_info.vendor_script_hash.clone(),
-                ref_info.vendor_script_index,
-            ),
-            (
-                ref_info.treasury_script_hash.clone(),
-                ref_info.treasury_script_index,
-            ),
-        ])
-        .await
-        .unwrap_or_default();
-    let ref_script_bytes: u64 = ref_utxos
-        .iter()
-        .map(|u| u.reference_script_size() as u64)
-        .sum();
+    let ref_utxos = references::treasury_references(
+        koios,
+        instance,
+        (ref_info.registry_hash.clone(), ref_info.registry_index),
+        (
+            ref_info.vendor_script_hash.clone(),
+            ref_info.vendor_script_index,
+        ),
+        (
+            ref_info.treasury_script_hash.clone(),
+            ref_info.treasury_script_index,
+        ),
+        &[],
+    )
+    .await?;
+    let ref_script_bytes = references::total_script_bytes(&ref_utxos)?;
 
     let mut params = tx::modify::ModifyParams {
         vendor_utxo_hash: vendor_info.utxo_hash,
