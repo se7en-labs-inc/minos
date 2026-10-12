@@ -1,6 +1,7 @@
 mod coin_select;
 mod config;
 mod koios;
+mod maf;
 mod node;
 mod portal;
 mod scripts;
@@ -393,6 +394,60 @@ enum Commands {
         out: Option<PathBuf>,
     },
 
+    /// Generate a Milestone Acceptance Form document
+    Maf {
+        #[command(subcommand)]
+        cmd: MafCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MafCmd {
+    /// Populate MAF from GitHub PR and release history
+    Github {
+        /// GitHub repository (owner/repo), may be repeated
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+
+        /// Period start date (inclusive, YYYY-MM-DD)
+        #[arg(long)]
+        start_date: chrono::NaiveDate,
+
+        /// Period end date (inclusive, YYYY-MM-DD)
+        #[arg(long)]
+        end_date: chrono::NaiveDate,
+
+        /// Milestone label (e.g. "M2.1 Ongoing Maintenance - September 2026")
+        #[arg(long)]
+        milestone: String,
+
+        /// Project config file (project name, number, signatures, testing plan, comms)
+        #[arg(long, default_value = "project.md")]
+        project: PathBuf,
+
+        /// Output .docx file
+        #[arg(long, short = 'o', default_value = "MAF.docx")]
+        out: PathBuf,
+    },
+
+    /// Populate MAF from a monthly report markdown file or URL
+    Report {
+        /// Monthly report markdown file path or https:// URL
+        #[arg(long)]
+        report: String,
+
+        /// Milestone label (e.g. "M2.1 Ongoing Maintenance - September 2026")
+        #[arg(long)]
+        milestone: String,
+
+        /// Project config file (project name, number, signatures, testing plan, comms)
+        #[arg(long, default_value = "project.md")]
+        project: PathBuf,
+
+        /// Output .docx file
+        #[arg(long, short = 'o', default_value = "MAF.docx")]
+        out: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -604,6 +659,22 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Commands::Maf { cmd } => match cmd {
+            MafCmd::Github {
+                repos,
+                start_date,
+                end_date,
+                milestone,
+                project,
+                out,
+            } => maf::cmd_maf_github(repos, start_date, end_date, milestone, project, out).await,
+            MafCmd::Report {
+                report,
+                milestone,
+                project,
+                out,
+            } => maf::cmd_maf_report(report, milestone, project, out).await,
+        },
     }
 }
 
