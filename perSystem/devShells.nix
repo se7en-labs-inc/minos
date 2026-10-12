@@ -24,6 +24,7 @@
           zlib
           config.treefmt.build.wrapper
         ];
+        LD_LIBRARY_PATH = lib.makeLibraryPath [stdenv.cc.cc.lib];
       };
   };
 }

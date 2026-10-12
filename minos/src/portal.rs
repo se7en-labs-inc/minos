@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub struct Portal {
@@ -255,10 +254,7 @@ fn parse_project(v: &Value) -> Result<Project> {
         identifier: str(v, "identifier")?,
         label: str(v, "label")?,
         description: str(v, "description")?,
-        vendor_label: v["vendor"]["label"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
+        vendor_label: v["vendor"]["label"].as_str().unwrap_or("").to_string(),
         milestones: v["milestones"]
             .as_array()
             .map(|arr| arr.iter().map(parse_milestone).collect::<Result<Vec<_>>>())
@@ -278,7 +274,7 @@ fn parse_project(v: &Value) -> Result<Project> {
 fn parse_milestone(v: &Value) -> Result<Milestone> {
     let raw_status = v["status"].as_str().unwrap_or("Active");
     let status = match raw_status {
-        "ACTIVE" | "Active" => MilestoneStatus::Active,
+        "ACTIVE" | "Active" | "MATURED" | "Matured" => MilestoneStatus::Active,
         "PAUSED" | "Paused" => MilestoneStatus::Paused,
         "WITHDRAWN" | "Withdrawn" => MilestoneStatus::Withdrawn,
         "CANCELLED" | "Cancelled" => MilestoneStatus::Cancelled,
@@ -339,7 +335,7 @@ fn parse_project_output(v: &Value) -> Result<ProjectOutput> {
                             .or_else(|| qty_raw.as_str().and_then(|s| s.parse().ok()))
                             .context("value.quantity")?;
                         Ok(AssetValue {
-                            asset_id: str(a, "assetId")?,
+                            asset_id: normalize_asset_id(&str(a, "assetId")?),
                             quantity,
                         })
                     })
@@ -348,6 +344,19 @@ fn parse_project_output(v: &Value) -> Result<ProjectOutput> {
             .transpose()?
             .unwrap_or_default(),
     })
+}
+
+/// Normalize portal assetId to our internal format.
+/// Portal may return "ada.lovelace" for ADA or "policyHex.assetNameHex" for tokens.
+/// We use "" for ADA and "policyHexassetNameHex" (concatenated) for tokens.
+fn normalize_asset_id(raw: &str) -> String {
+    if raw.is_empty() || raw == "ada.lovelace" {
+        return String::new();
+    }
+    if let Some(dot) = raw.find('.') {
+        return format!("{}{}", &raw[..dot], &raw[dot + 1..]);
+    }
+    raw.to_string()
 }
 
 fn str(v: &Value, key: &str) -> Result<String> {

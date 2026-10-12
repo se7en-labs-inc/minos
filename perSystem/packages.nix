@@ -22,12 +22,15 @@
       fileset = lib.fileset.unions [
         ../Cargo.lock
         ../Cargo.toml
-        ../src
+        ../minos/Cargo.toml
+        ../minos/src
+        ../minos-portal/Cargo.toml
+        ../minos-portal/src
       ];
     };
 
     # Extract pname and version from Cargo.toml
-    crateInfo = craneLib.crateNameFromCargoToml {cargoToml = ../Cargo.toml;};
+    crateInfo = craneLib.crateNameFromCargoToml {cargoToml = ../minos/Cargo.toml;};
 
     commonArgs = {
       inherit src;
@@ -35,8 +38,11 @@
       strictDeps = true;
 
       nativeBuildInputs = with pkgs; [
+        cmake
         pkg-config
       ];
+
+      buildInputs = with pkgs; [openssl zlib];
 
       meta = {
         mainProgram = crateInfo.pname;
@@ -51,6 +57,7 @@
 
     # Build dependencies separately for better caching
     cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
   in {
     checks = {
       clippy = craneLib.cargoClippy (commonArgs
