@@ -58,6 +58,45 @@
     # Build dependencies separately for better caching
     cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
+    minosUi = pkgs.stdenv.mkDerivation {
+      pname = "minos-ui";
+      version = "0.1.0";
+
+      src = lib.fileset.toSource {
+        root = ./..;
+        fileset = lib.fileset.unions [
+          ../minos-ui/elm.json
+          ../minos-ui/elm-packages.nix
+          ../minos-ui/registry.dat
+          ../minos-ui/shell.html
+          ../minos-ui/src
+        ];
+      };
+
+      nativeBuildInputs = with pkgs; [elmPackages.elm];
+
+      configurePhase = pkgs.elmPackages.fetchElmDeps {
+        elmPackages = import ../minos-ui/elm-packages.nix;
+        elmVersion = "0.19.1";
+        registryDat = ../minos-ui/registry.dat;
+      };
+
+      buildPhase = ''
+        cd minos-ui
+        elm make src/Main.elm --optimize --output=main.js
+      '';
+
+      installPhase = ''
+        mkdir -p $out
+        cp main.js $out/main.js
+        cp shell.html $out/index.html
+      '';
+
+      meta = {
+        maintainers = with lib.maintainers; [disassembler];
+        license = with lib.licenses; [asl20];
+      };
+    };
   in {
     checks = {
       clippy = craneLib.cargoClippy (commonArgs
@@ -67,6 +106,8 @@
         });
 
       fmt = craneLib.cargoFmt {inherit src;};
+
+      inherit minosUi;
     };
 
     packages = {
@@ -77,6 +118,8 @@
           inherit cargoArtifacts;
           doCheck = true;
         });
+
+      minos-ui = minosUi;
     };
   };
 }

@@ -11,6 +11,8 @@
       programs.rustfmt.enable = true;
       programs.taplo.enable = true;
 
+      programs.elm-format.enable = true;
+
       settings.global.excludes = [
         "*.lock"
         "*.patch"
@@ -18,6 +20,7 @@
         ".gitignore"
         ".gitmodules"
         "LICENSE"
+        "elm-stuff"
       ];
     };
 

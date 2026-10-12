@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Minos Treasury</title>
+  <script src="main.js"></script>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    var app = Elm.Main.init({
+      node: document.getElementById("app"),
+      flags: {
+        portalUrl: window.MINOS_PORTAL_URL || "http://localhost:8080/graphql"
+      }
+    });
+  </script>
+</body>
+</html>

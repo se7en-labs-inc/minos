@@ -23,6 +23,13 @@
           openssl
           zlib
           config.treefmt.build.wrapper
+          # Elm
+          elmPackages.elm
+          elmPackages.elm-format
+          elmPackages.elm-language-server
+          elmPackages.elm-test
+          elmPackages.elm-live
+          elm2nix
         ];
         LD_LIBRARY_PATH = lib.makeLibraryPath [stdenv.cc.cc.lib];
       };
