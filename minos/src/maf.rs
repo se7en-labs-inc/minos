@@ -119,7 +119,6 @@ const LINK: &str = "1155CC";
 const FONT: &str = "Calibri";
 const PT10: usize = 20; // half-points
 const PT11: usize = 22;
-const PT14: usize = 28;
 const PT18: usize = 36;
 
 // Cell padding (twips)
@@ -306,7 +305,6 @@ struct ReportRelease {
 struct BackendVersion {
     name: String,
     pinned: String,
-    latest: String,
     status: String,
 }
 
@@ -462,7 +460,6 @@ pub fn parse_report_md_str(content: &str) -> Result<ReportData> {
             Some(BackendVersion {
                 name: parts[0].trim().to_string(),
                 pinned: parts[1].trim().to_string(),
-                latest: parts[2].trim().to_string(),
                 status: parts[3].trim().to_string(),
             })
         })
@@ -723,11 +720,17 @@ fn build_acceptance_paras_from_report(report: &ReportData) -> Vec<Paragraph> {
 
     // Report URL
     if !report.report_url.is_empty() {
-        out.push(p_link(
-            "Full monthly report: ",
-            &report.report_url,
-            &report.report_url,
-        ));
+        // Published Daedalus report data can still reference the artifact host.
+        // Point readers to the public reports page while retaining other projects' URLs.
+        let report_url = if report
+            .report_url
+            .starts_with("https://daedalus.se7enlabs.org/reports/")
+        {
+            "https://daedaluswallet.io/reports/"
+        } else {
+            &report.report_url
+        };
+        out.push(p_link("Monthly reports: ", report_url, report_url));
     }
 
     out
@@ -776,7 +779,7 @@ fn build_acceptance_paras(
         if rels.is_empty() {
             continue;
         }
-        out.push(pb(&format!("Releases Published — {repo}")));
+        out.push(pb(&format!("GitHub Release Records — {repo}")));
         for rel in rels {
             out.push(p_link(
                 &format!("  {} — {} — ", rel.tag_name, rel.date_str()),
@@ -805,6 +808,7 @@ pub struct ProjectConfig {
     pub signatures: Vec<Signature>,
     pub testing_plan_md: String,
     pub public_comms_md: String,
+    pub assurer_comments_md: Option<String>,
 }
 
 pub fn parse_project_md(path: &Path) -> Result<ProjectConfig> {
@@ -875,6 +879,10 @@ pub fn parse_project_md(path: &Path) -> Result<ProjectConfig> {
             .get("Public Communications")
             .cloned()
             .unwrap_or_default(),
+        assurer_comments_md: sections
+            .get("Third Party Assurer Comments")
+            .filter(|comments| !comments.is_empty())
+            .cloned(),
     })
 }
 
@@ -955,6 +963,7 @@ pub struct MafOptions {
     pub signatures: Vec<Signature>,
     pub testing_plan: Vec<Paragraph>,
     pub public_comms: Vec<Paragraph>,
+    pub assurer_comments: Option<Vec<Paragraph>>,
 }
 
 pub fn generate_docx(
@@ -963,6 +972,17 @@ pub fn generate_docx(
     out: &Path,
 ) -> Result<()> {
     let ac = acceptance_paras;
+    let mut comments_cell = TableCell::new()
+        .width(TOTAL_W, WidthType::Dxa)
+        .grid_span(2)
+        .shading(Shading::new().fill("FFFFFF").color("auto"));
+    let comments = opts
+        .assurer_comments
+        .clone()
+        .unwrap_or_else(|| vec![p(""); 5]);
+    for paragraph in comments {
+        comments_cell = comments_cell.add_paragraph(paragraph);
+    }
 
     let main_table = Table::new(vec![
         title_row("Milestone Acceptance Form (MAF)"),
@@ -981,15 +1001,7 @@ pub fn generate_docx(
         form_row("Public Communication Summary", opts.public_comms.clone()),
         divider_row(),
         section_row("Third Party Assurer Comments"),
-        TableRow::new(vec![TableCell::new()
-            .width(TOTAL_W, WidthType::Dxa)
-            .grid_span(2)
-            .shading(Shading::new().fill("FFFFFF").color("auto"))
-            .add_paragraph(p(""))
-            .add_paragraph(p(""))
-            .add_paragraph(p(""))
-            .add_paragraph(p(""))
-            .add_paragraph(p(""))]),
+        TableRow::new(vec![comments_cell]),
         divider_row(),
         section_row("Signature Authorization"),
     ])
@@ -1049,6 +1061,10 @@ pub async fn cmd_maf_github(
     let sub = |s: &str| s.replace("[MONTH YEAR]", &month_year);
     let testing_plan = markdown_to_paras(&sub(&project.testing_plan_md));
     let public_comms = markdown_to_paras(&sub(&project.public_comms_md));
+    let assurer_comments = project
+        .assurer_comments_md
+        .as_deref()
+        .map(|md| markdown_to_paras(&sub(md)));
 
     let opts = MafOptions {
         project_name: project.name,
@@ -1057,6 +1073,7 @@ pub async fn cmd_maf_github(
         signatures: project.signatures,
         testing_plan,
         public_comms,
+        assurer_comments,
     };
 
     let ac = build_acceptance_paras(&all_prs, &all_rels);
@@ -1091,6 +1108,10 @@ pub async fn cmd_maf_report(
     let sub = |s: &str| s.replace("[MONTH YEAR]", &month_year);
     let testing_plan = markdown_to_paras(&sub(&project.testing_plan_md));
     let public_comms = markdown_to_paras(&sub(&project.public_comms_md));
+    let assurer_comments = project
+        .assurer_comments_md
+        .as_deref()
+        .map(|md| markdown_to_paras(&sub(md)));
     let ac = build_acceptance_paras_from_report(&report);
     let opts = MafOptions {
         project_name: project.name,
@@ -1099,6 +1120,7 @@ pub async fn cmd_maf_report(
         signatures: project.signatures,
         testing_plan,
         public_comms,
+        assurer_comments,
     };
     generate_docx(&opts, ac, &out)?;
     println!("Written: {}", out.display());
