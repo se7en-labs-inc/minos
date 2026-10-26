@@ -4,6 +4,27 @@
 use anyhow::Result;
 use uplc::ast::{DeBruijn, Program};
 
+/// Apply a single PlutusData-encoded parameter to a compiled Plutus V3 script.
+///
+/// `base_script_cbor` — the outer CBOR-wrapped flat bytes (from plutus.json `compiledCode`,
+///                       hex-decoded).
+/// `param_cbor`       — the CBOR encoding of the parameter (PlutusData).
+///
+/// Returns the new outer CBOR-wrapped flat bytes.
+pub fn apply_param(base_script_cbor: &[u8], param_cbor: &[u8]) -> Result<Vec<u8>> {
+    let mut flat_buf = Vec::new();
+    let program = Program::<DeBruijn>::from_cbor(base_script_cbor, &mut flat_buf)
+        .map_err(|e| anyhow::anyhow!("uplc decode: {e}"))?;
+
+    let param =
+        uplc::plutus_data(param_cbor).map_err(|e| anyhow::anyhow!("plutus_data decode: {e}"))?;
+
+    let applied = program.apply_data(param);
+
+    applied
+        .to_cbor()
+        .map_err(|e| anyhow::anyhow!("uplc encode: {e}"))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,26 +134,4 @@ mod tests {
             first_term_nibble
         );
     }
-}
-
-/// Apply a single PlutusData-encoded parameter to a compiled Plutus V3 script.
-///
-/// `base_script_cbor` — the outer CBOR-wrapped flat bytes (from plutus.json `compiledCode`,
-///                       hex-decoded).
-/// `param_cbor`       — the CBOR encoding of the parameter (PlutusData).
-///
-/// Returns the new outer CBOR-wrapped flat bytes.
-pub fn apply_param(base_script_cbor: &[u8], param_cbor: &[u8]) -> Result<Vec<u8>> {
-    let mut flat_buf = Vec::new();
-    let program = Program::<DeBruijn>::from_cbor(base_script_cbor, &mut flat_buf)
-        .map_err(|e| anyhow::anyhow!("uplc decode: {e}"))?;
-
-    let param =
-        uplc::plutus_data(param_cbor).map_err(|e| anyhow::anyhow!("plutus_data decode: {e}"))?;
-
-    let applied = program.apply_data(param);
-
-    applied
-        .to_cbor()
-        .map_err(|e| anyhow::anyhow!("uplc encode: {e}"))
 }

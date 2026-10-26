@@ -15,10 +15,6 @@ impl Network {
         }
     }
 
-    pub fn default_portal_url(&self) -> &str {
-        self.portal_graphql_url()
-    }
-
     pub fn koios_base_url(&self) -> &str {
         match self {
             Network::Preview => "https://preview.koios.rest/api/v1",

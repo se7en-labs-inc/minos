@@ -6,6 +6,72 @@ use anyhow::{Context, Result};
 use pallas_codec::minicbor::Decoder;
 use pallas_crypto::hash::{Hash, Hasher};
 
+/// Attach an airgap witness only after checking its exact body and required signer.
+pub fn assemble_witness(
+    tx_cbor: &[u8],
+    envelope: &str,
+    expected_body_hash: &[u8; 32],
+    required_signer: &[u8; 28],
+) -> Result<Vec<u8>> {
+    let mut decoder = Decoder::new(tx_cbor);
+    let tx: pallas_primitives::conway::Tx<'_> = decoder.decode()?;
+    anyhow::ensure!(
+        decoder.position() == tx_cbor.len(),
+        "trailing transaction bytes"
+    );
+    let hash = tx_body_hash(tx_cbor)?;
+    anyhow::ensure!(
+        &hash == expected_body_hash,
+        "unexpected transaction body hash"
+    );
+    anyhow::ensure!(
+        tx.transaction_body
+            .required_signers
+            .as_ref()
+            .is_some_and(|s| s.iter().any(|h| h.as_ref() == required_signer)),
+        "signer is not required by transaction body"
+    );
+    let json: serde_json::Value = serde_json::from_str(envelope)?;
+    anyhow::ensure!(
+        json["type"] == "TxWitness ConwayEra",
+        "expected TxWitness ConwayEra"
+    );
+    let bytes = hex::decode(
+        json["cborHex"]
+            .as_str()
+            .context("missing witness cborHex")?,
+    )?;
+    let mut dec = Decoder::new(&bytes);
+    anyhow::ensure!(dec.array()? == Some(2), "expected witness pair");
+    let vkey: [u8; 32] = dec
+        .bytes()?
+        .try_into()
+        .context("invalid public key length")?;
+    let signature: [u8; 64] = dec
+        .bytes()?
+        .try_into()
+        .context("invalid signature length")?;
+    anyhow::ensure!(dec.position() == bytes.len(), "trailing witness bytes");
+    anyhow::ensure!(
+        Hasher::<224>::hash(&vkey).as_ref() == required_signer,
+        "wrong witness signer"
+    );
+    anyhow::ensure!(
+        pallas_crypto::key::ed25519::PublicKey::from(vkey).verify(
+            hash,
+            &pallas_crypto::key::ed25519::Signature::from(signature)
+        ),
+        "invalid witness over transaction body"
+    );
+    let assembled = add_vkey_witness(tx_cbor, &vkey, &signature)?;
+    let _: pallas_primitives::conway::Tx<'_> = pallas_codec::minicbor::decode(&assembled)?;
+    anyhow::ensure!(
+        tx_body_hash(&assembled)? == hash,
+        "assembly changed transaction body"
+    );
+    Ok(assembled)
+}
+
 /// Compute the tx body hash (blake2b-256 of the body CBOR bytes).
 pub fn tx_body_hash(tx_cbor: &[u8]) -> Result<[u8; 32]> {
     let mut dec = Decoder::new(tx_cbor);
@@ -47,6 +113,10 @@ pub fn add_vkey_witness(tx_cbor: &[u8], vkey: &[u8; 32], signature: &[u8; 64]) -
     let mut ws_entries: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut existing_vkwitnesses: Vec<Vec<u8>> = Vec::new();
 
+    anyhow::ensure!(
+        ws_map_type == pallas_codec::minicbor::data::Type::Map,
+        "expected definite witness map"
+    );
     if ws_map_type == pallas_codec::minicbor::data::Type::Map {
         let n = wsdec
             .map()
@@ -60,7 +130,13 @@ pub fn add_vkey_witness(tx_cbor: &[u8], vkey: &[u8; 32], signature: &[u8; 64]) -
             if key == 0 {
                 // Collect existing vkeywitnesses so we can append
                 let mut vdec = Decoder::new(&val_bytes);
-                let cnt = vdec.array().context("vkw array")?.unwrap_or(0);
+                if vdec.datatype()? == pallas_codec::minicbor::data::Type::Tag {
+                    anyhow::ensure!(vdec.tag()?.as_u64() == 258, "unexpected witness set tag");
+                }
+                let cnt = vdec
+                    .array()
+                    .context("vkw array")?
+                    .context("indefinite vkey set unsupported")?;
                 for _ in 0..cnt {
                     let ws_start2 = vdec.position();
                     vdec.skip().context("vkw entry skip")?;

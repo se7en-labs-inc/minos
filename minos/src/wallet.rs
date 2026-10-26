@@ -79,6 +79,20 @@ pub fn enterprise_address(mnemonic: &Mnemonic, account: u32, network_id: u8) -> 
     ))
 }
 
+/// Derive the base-address form using payment 0/0 and stake 2/0 of this account.
+pub fn base_address(mnemonic: &Mnemonic, account: u32, network_id: u8) -> Address {
+    let account = account_xprv(&root_key(&mnemonic.to_entropy(), b""), account);
+    Address::Shelley(ShelleyAddress::new(
+        if network_id == 1 {
+            Network::Mainnet
+        } else {
+            Network::Testnet
+        },
+        ShelleyPaymentPart::key_hash(vkey_hash(&child_xprv(&account, 0, 0))),
+        ShelleyDelegationPart::key_hash(vkey_hash(&child_xprv(&account, 2, 0))),
+    ))
+}
+
 /// Sign the tx body hash with the account N payment key.
 /// Returns (vkey_32_bytes, signature_64_bytes).
 pub fn sign_tx_body(mnemonic: &Mnemonic, account: u32, body_hash: &[u8]) -> ([u8; 32], [u8; 64]) {
@@ -87,7 +101,7 @@ pub fn sign_tx_body(mnemonic: &Mnemonic, account: u32, body_hash: &[u8]) -> ([u8
     let xpub = key.public();
     let sig = key.sign::<()>(body_hash);
     let vk: [u8; 32] = xpub.as_ref()[..32].try_into().unwrap();
-    let sig_bytes: [u8; 64] = (*sig.to_bytes()).into();
+    let sig_bytes: [u8; 64] = *sig.to_bytes();
     (vk, sig_bytes)
 }
 

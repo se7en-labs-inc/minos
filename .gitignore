@@ -1,4 +1,9 @@
 target
+/m21-airgap-request.json
+/m21-airgap-review.json
+/m21-airgap-signed.json
+/complete-m21-mainnet-labeled-inspection.json
+/complete-m21-mainnet-labeled-review.json
 result
 .direnv
 .claude/settings.local.json
@@ -14,6 +19,7 @@ minos-ui/main.js
 /*.txwit*
 /*-signed.json
 /*-unsigned.json
+/preview-*.json
 /adjudicate*.json
 /complete.json
 /fund.json

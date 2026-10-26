@@ -14,7 +14,7 @@ impl Portal {
         }
     }
 
-    async fn query(&self, query: &str, variables: Option<Value>) -> Result<Value> {
+    pub async fn query(&self, query: &str, variables: Option<Value>) -> Result<Value> {
         let body = match variables {
             Some(vars) => json!({ "query": query, "variables": vars }),
             None => json!({ "query": query }),
@@ -106,6 +106,133 @@ impl Portal {
         );
         Ok(())
     }
+
+    /// Explicit opt-in to the remote portal's submission/signing workflow.
+    /// Acceptance by this API does not itself prove chain confirmation.
+    pub async fn submit_transaction(&self, label: &str, cbor_hex: &str) -> Result<()> {
+        let bytes = hex::decode(cbor_hex).context("invalid transaction hex")?;
+        let tx: pallas_primitives::conway::Tx<'_> =
+            pallas_codec::minicbor::decode(&bytes).context("invalid Conway transaction")?;
+        let witnesses = tx
+            .transaction_witness_set
+            .vkeywitness
+            .as_ref()
+            .filter(|w| !w.is_empty())
+            .context("transaction has no vkey witnesses; witness it on the airgap first")?;
+        let hash = crate::tx::sign::tx_body_hash(&bytes)?;
+        for witness in witnesses.iter() {
+            let key: [u8; 32] = witness
+                .vkey
+                .as_slice()
+                .try_into()
+                .context("invalid witness public key")?;
+            let signature: [u8; 64] = witness
+                .signature
+                .as_slice()
+                .try_into()
+                .context("invalid witness signature")?;
+            let key = pallas_crypto::key::ed25519::PublicKey::from(key);
+            let signature = pallas_crypto::key::ed25519::Signature::from(signature);
+            anyhow::ensure!(
+                key.verify(hash, &signature),
+                "invalid witness over transaction body"
+            );
+        }
+        let data = self
+            .query(
+                "mutation SubmitTx($tx: TransactionInput!) { newTransaction(tx: $tx) { ok } }",
+                Some(json!({"tx": {"label": label, "cborHex": cbor_hex}})),
+            )
+            .await?;
+        anyhow::ensure!(
+            data["newTransaction"]["ok"].as_bool() == Some(true)
+                || data["newTransaction"]["ok"].as_str() == Some("Ok"),
+            "portal did not accept the witnessed transaction"
+        );
+        Ok(())
+    }
+
+    pub async fn fee_inputs(&self) -> Result<Vec<FeeInput>> {
+        let data = self
+            .query(
+                "query { feeInputs { transaction index address reservedUntil } }",
+                None,
+            )
+            .await?;
+        serde_json::from_value(data["feeInputs"].clone()).context("decode portal fee inputs")
+    }
+
+    pub async fn server_timestamp(&self) -> Result<String> {
+        let data = self.query("query { now { unixMilli } }", None).await?;
+        let millis: i64 = data["now"]["unixMilli"]
+            .as_str()
+            .context("missing server time")?
+            .parse()?;
+        Ok(chrono::DateTime::from_timestamp_millis(millis)
+            .context("invalid server time")?
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    }
+
+    pub async fn evidence_upload_ticket(&self, input: Value) -> Result<String> {
+        let data = self.query(
+            "mutation UploadTicket($input: CreateEvidenceUploadTicketInput!) { createEvidenceUploadTicket(input: $input) { uploads { uploadUrl } } }",
+            Some(json!({"input": input})),
+        ).await?;
+        let uploads = data["createEvidenceUploadTicket"]["uploads"]
+            .as_array()
+            .context("missing upload slots")?;
+        anyhow::ensure!(uploads.len() == 1, "expected one upload slot");
+        Ok(uploads[0]["uploadUrl"]
+            .as_str()
+            .context("missing upload URL")?
+            .to_owned())
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeeInput {
+    pub transaction: String,
+    pub index: u64,
+    pub address: String,
+    pub reserved_until: Option<String>,
+}
+
+impl FeeInput {
+    pub fn available_at(&self, now: chrono::DateTime<chrono::Utc>) -> Result<bool> {
+        self.reserved_until
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .map_or(Ok(true), |value| {
+                Ok(value
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .context("invalid fee input reservation timestamp")?
+                    < now)
+            })
+    }
+}
+
+/// Intersect the advertised pool with current chain outputs; use chain values.
+pub fn sponsored_utxos(
+    rows: &[FeeInput],
+    live: Vec<crate::koios::Utxo>,
+    address: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<crate::koios::Utxo>> {
+    let mut allowed = std::collections::BTreeSet::new();
+    for row in rows {
+        if row.address == address && row.available_at(now)? {
+            allowed.insert((row.transaction.as_str(), row.index));
+        }
+    }
+    Ok(live
+        .into_iter()
+        .filter(|u| {
+            u.address == address
+                && !u.has_native_assets()
+                && allowed.contains(&(u.tx_hash.as_str(), u.tx_index))
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@
         ../Cargo.toml
         ../minos/Cargo.toml
         ../minos/src
+        ../minos/tests
         ../minos-portal/Cargo.toml
         ../minos-portal/src
       ];
@@ -43,6 +44,7 @@
       ];
 
       buildInputs = with pkgs; [openssl zlib];
+      nativeCheckInputs = with pkgs; [gnupg openssl];
 
       meta = {
         mainProgram = crateInfo.pname;

@@ -37,6 +37,9 @@ pub struct PublishParams {
 
     // Admin: single key hash used for ALL permissions (treasury + vendor).
     pub admin_key_hash: Vec<u8>,
+    /// All administrator keys; txAuthor must be one of them.
+    pub admin_keys: Vec<Vec<u8>>,
+    pub admin_threshold: u64,
 
     // Instance timings (POSIX milliseconds)
     pub expiration_ms: u64,
@@ -65,7 +68,39 @@ pub struct PublishParams {
     pub network_id: u8,
 }
 
+pub fn admin_permission(keys: &[Vec<u8>], threshold: u64) -> Result<MultisigScript> {
+    anyhow::ensure!(!keys.is_empty(), "at least one administrator is required");
+    anyhow::ensure!(
+        threshold > 0 && threshold <= keys.len() as u64,
+        "admin threshold must be between 1 and the number of administrators"
+    );
+    let mut unique = std::collections::BTreeSet::new();
+    for key in keys {
+        anyhow::ensure!(key.len() == 28, "admin keys must be 28 bytes");
+        anyhow::ensure!(unique.insert(key), "duplicate administrator key");
+    }
+    let scripts: Vec<_> = keys
+        .iter()
+        .map(|key| MultisigScript::Signature {
+            key_hash: key.clone(),
+        })
+        .collect();
+    Ok(if scripts.len() == 1 {
+        scripts[0].clone()
+    } else {
+        MultisigScript::AtLeast {
+            required: threshold,
+            scripts,
+        }
+    })
+}
+
 pub fn build(params: PublishParams) -> Result<UnsignedTx> {
+    let admin_sig = admin_permission(&params.admin_keys, params.admin_threshold)?;
+    anyhow::ensure!(
+        params.admin_keys.contains(&params.admin_key_hash),
+        "transaction author must be an administrator"
+    );
     // -----------------------------------------------------------------------
     // 1. Parse seed UTxO hash
     // -----------------------------------------------------------------------
@@ -77,10 +112,6 @@ pub fn build(params: PublishParams) -> Result<UnsignedTx> {
     // -----------------------------------------------------------------------
     // 2. Derive all scripts
     // -----------------------------------------------------------------------
-    let admin_sig = MultisigScript::Signature {
-        key_hash: params.admin_key_hash.clone(),
-    };
-
     let treasury_perms = TreasuryPermissions {
         reorganize: admin_sig.clone(),
         sweep: admin_sig.clone(),
@@ -112,7 +143,7 @@ pub fn build(params: PublishParams) -> Result<UnsignedTx> {
             .context("parameterize vendor")?;
     let vendor_hash = script_hash(&vendor_cbor);
 
-    let registry_datum = encode_script_hash_registry(&*treasury_hash, &*vendor_hash);
+    let registry_datum = encode_script_hash_registry(&treasury_hash, &vendor_hash);
 
     // -----------------------------------------------------------------------
     // 3. Build addresses
@@ -252,6 +283,7 @@ pub fn build(params: PublishParams) -> Result<UnsignedTx> {
         params.payout_upperbound_ms,
         params.vendor_expiration_ms,
         &admin_key_hex_str,
+        &admin_sig,
         &params.label,
         params.description.as_deref(),
     )?;

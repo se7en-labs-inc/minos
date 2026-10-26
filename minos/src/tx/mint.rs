@@ -24,6 +24,7 @@ pub struct MintParams {
 
     // How many FTs to mint (base units — multiply by 10^decimals for "whole" tokens).
     pub ft_amount: u64,
+    pub mint_reference: bool,
 
     // Token info
     pub token_ticker: String, // e.g. "USDM7"
@@ -51,6 +52,14 @@ pub struct MintResult {
 }
 
 pub fn build(params: MintParams) -> Result<MintResult> {
+    anyhow::ensure!(
+        params.ft_amount > 0 && params.ft_amount <= i64::MAX as u64,
+        "mint amount must fit a positive signed 64-bit integer"
+    );
+    anyhow::ensure!(
+        params.token_ticker.len() <= 28,
+        "ticker exceeds asset name limit"
+    );
     // -----------------------------------------------------------------------
     // 1. Native script: [0, key_hash]
     // -----------------------------------------------------------------------
@@ -110,12 +119,15 @@ pub fn build(params: MintParams) -> Result<MintResult> {
     //    (c) Change → fee_addr
     // -----------------------------------------------------------------------
     // Put both NFT and FTs in a single output to keep it simple.
-    let token_output = Output::new(dest_addr.clone(), 3_000_000)
-        .add_asset(policy_hash, ref_name.clone(), 1)
-        .context("add ref NFT")?
+    let mut token_output = Output::new(dest_addr.clone(), 3_000_000)
         .add_asset(policy_hash, ft_name.clone(), params.ft_amount)
-        .context("add FTs")?
-        .set_inline_datum(datum_bytes);
+        .context("add FTs")?;
+    if params.mint_reference {
+        token_output = token_output
+            .add_asset(policy_hash, ref_name.clone(), 1)
+            .context("add ref NFT")?
+            .set_inline_datum(datum_bytes);
+    }
 
     let change_output = Output::new(fee_addr, params.change_lovelace);
 
@@ -138,10 +150,14 @@ pub fn build(params: MintParams) -> Result<MintResult> {
         // Native script in witness set
         .script(ScriptKind::Native, script_cbor)
         // Mint ref NFT + FTs
-        .mint_asset(policy_hash, ref_name.clone(), 1)
-        .context("mint ref NFT")?
         .mint_asset(policy_hash, ft_name.clone(), params.ft_amount as i64)
         .context("mint FTs")?;
+
+    if params.mint_reference {
+        staging = staging
+            .mint_asset(policy_hash, ref_name.clone(), 1)
+            .context("mint ref NFT")?;
+    }
 
     for inp in &params.inputs {
         let h: [u8; 32] = hex::decode(&inp.tx_hash)

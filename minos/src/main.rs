@@ -1,3 +1,4 @@
+mod airgap_cli;
 mod config;
 mod maf;
 use minos::{coin_select, koios, node, portal, references, tx, types, wallet};
@@ -44,6 +45,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum WalletCmd {
+    /// Build an unsigned ADA-only wallet transfer
+    Send {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        ada: u64,
+        #[arg(long, default_value_t = 1)]
+        outputs: u16,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Fetch confirmed transaction CBOR over Koios and verify its body hash
+    Fetch {
+        #[arg(long)]
+        hash: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Inspect a transaction's public CBOR fields and body hash without signing
+    Inspect {
+        #[arg(long)]
+        tx: PathBuf,
+    },
     /// Generate a new 24-word mnemonic
     New {
         /// GPG recipient email for encrypted output (implies --out)
@@ -57,6 +83,9 @@ enum WalletCmd {
 
     /// Show address and key hash for an account
     Address {
+        /// Include the account's staking credential in a base address
+        #[arg(long)]
+        base: bool,
         /// Wallet file (plain text or .gpg). Reads from stdin if omitted.
         #[arg(long, short = 'w')]
         wallet: Option<PathBuf>,
@@ -95,6 +124,122 @@ enum WalletCmd {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Save the portal's public HTML and client bundle for protocol inspection
+    PortalClient {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Deposit a project template's funds into its budget treasury
+    DepositProject {
+        /// Optional change address with the same payment credential and network
+        #[arg(long)]
+        change_addr: Option<String>,
+        /// Recreate an existing exact ADA treasury deposit with initialization metadata
+        #[arg(long)]
+        reuse_treasury: Option<String>,
+        #[arg(long)]
+        instance: String,
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        fee_addr: String,
+        #[arg(long)]
+        admin_key: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Clone a public project snapshot with M0 immediate and subsequent timed unlocks
+    CloneProject {
+        /// Override the vendor display label/address for the preview wallet
+        #[arg(long)]
+        vendor_label: Option<String>,
+        /// Replace every payout with this many whole ADA (preview only)
+        #[arg(long, conflicts_with_all = ["token_policy", "token_name"])]
+        ada_per_milestone: Option<u64>,
+        /// Override the project's identifier while preserving display text
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long, default_value_t = 15)]
+        interval_minutes: u64,
+        #[arg(
+            long,
+            required_unless_present = "ada_per_milestone",
+            requires = "token_name"
+        )]
+        token_policy: Option<String>,
+        #[arg(
+            long,
+            required_unless_present = "ada_per_milestone",
+            requires = "token_policy"
+        )]
+        token_name: Option<String>,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Fund a project from a cloned project template, preserving its metadata
+    FundProject {
+        /// Separate vendor payment key hash (defaults to admin key)
+        #[arg(long)]
+        vendor_key: Option<String>,
+        /// Additional signing admin payment key hash; repeat for multiple admins
+        #[arg(long)]
+        co_signer: Vec<String>,
+        /// Optional change address with the same payment credential and network
+        #[arg(long)]
+        change_addr: Option<String>,
+        /// Select a specific treasury funding UTxO
+        #[arg(long)]
+        treasury_utxo: Option<String>,
+        #[arg(long)]
+        instance: String,
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        fee_addr: String,
+        #[arg(long)]
+        admin_key: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Execute a portal GraphQL query/mutation (no node connection)
+    PortalQuery {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        variables: Option<PathBuf>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Query wallet UTxOs through the configured HTTP chain backend
+    Utxos {
+        #[arg(long)]
+        address: String,
+    },
+    /// Review, sign and verify a complete evidence package without network access
+    Airgap {
+        #[command(subcommand)]
+        cmd: airgap_cli::AirgapCmd,
+    },
+    /// Verify and attach a detached airgap witness without loading any keys
+    Assemble {
+        #[arg(long)]
+        tx: PathBuf,
+        #[arg(long)]
+        witness: PathBuf,
+        #[arg(long)]
+        expected_body_hash: String,
+        #[arg(long)]
+        required_signer: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Calculate an evidence CID locally; never uploads or pins files
+    Evidence {
+        #[command(subcommand)]
+        cmd: EvidenceCmd,
+    },
     /// Evaluate an unsigned withdrawal locally without signing or submitting
     Preflight {
         #[arg(long)]
@@ -112,6 +257,9 @@ enum Commands {
 
     /// Build an unsigned "complete" transaction (attach milestone evidence on-chain)
     Complete {
+        /// Known instance publish tx; use vendor reference output #2 if portal omits it
+        #[arg(long)]
+        publish_tx: Option<String>,
         /// Registry token policy ID (instance identifier)
         #[arg(long)]
         instance: String,
@@ -132,9 +280,25 @@ enum Commands {
         #[arg(long = "evidence-url")]
         evidence_urls: Vec<String>,
 
+        /// Display filename/label for each --evidence-url, in the same order
+        #[arg(long = "evidence-label", requires = "evidence_urls")]
+        evidence_labels: Vec<String>,
+
+        /// Local evidence file; calculate its CIDv1 raw/SHA-256 URL without uploading
+        #[arg(long = "evidence-file")]
+        evidence_files: Vec<PathBuf>,
+
+        /// Use the portal's live, unreserved sponsored fee inputs
+        #[arg(
+            long,
+            conflicts_with = "fee_addr",
+            required_unless_present = "fee_addr"
+        )]
+        portal_fees: bool,
+
         /// Wallet address (for fee inputs and collateral)
-        #[arg(long)]
-        fee_addr: String,
+        #[arg(long, required_unless_present = "portal_fees")]
+        fee_addr: Option<String>,
 
         /// Write unsigned tx to this file (default: print to stdout)
         #[arg(long, short = 'o')]
@@ -197,6 +361,10 @@ enum Commands {
         /// Skip chain submission; only register with portal (use if tx is already on-chain)
         #[arg(long)]
         portal_only: bool,
+
+        /// Send witnessed CBOR to the portal's newTransaction submission workflow
+        #[arg(long, conflicts_with = "portal_only")]
+        via_portal: bool,
     },
 
     /// Wallet management (key derivation, signing)
@@ -211,9 +379,13 @@ enum Commands {
         #[arg(long)]
         fee_addr: String,
 
-        /// Admin key hash (hex, 28 bytes) — controls all treasury/vendor permissions
-        #[arg(long)]
-        admin_key: String,
+        /// Administrator payment key hash; repeat for a threshold policy (first is txAuthor)
+        #[arg(long, required = true)]
+        admin_key: Vec<String>,
+
+        /// Number of administrator signatures required by each permission
+        #[arg(long, default_value_t = 1)]
+        admin_threshold: u64,
 
         /// Instance expiration (RFC 3339 or POSIX ms)
         #[arg(long)]
@@ -386,6 +558,10 @@ enum Commands {
         #[arg(long)]
         amount: u64,
 
+        /// Mint more fungible units without creating another CIP-68 reference NFT
+        #[arg(long)]
+        existing_asset: bool,
+
         /// Destination address for minted tokens (defaults to --fee-addr)
         #[arg(long)]
         dest_addr: Option<String>,
@@ -399,6 +575,35 @@ enum Commands {
     Maf {
         #[command(subcommand)]
         cmd: MafCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum EvidenceCmd {
+    /// Prepare one self-contained transaction/PDF/upload package for offline signing
+    PreparePackage {
+        #[arg(long)]
+        tx: PathBuf,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Upload PDF using both verified returned signatures; write ready tx, never submit
+    UploadPackage {
+        #[arg(long)]
+        package: PathBuf,
+        #[arg(long)]
+        signed: PathBuf,
+        #[arg(long)]
+        receipt: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Print ipfs://CID using CIDv1 raw/SHA-256/base32 (not a UnixFS import)
+    Cid {
+        #[arg(long)]
+        file: PathBuf,
     },
 }
 
@@ -454,6 +659,24 @@ enum MafCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let (fund_vendor_key, fund_co_signers) = match &cli.command {
+        Commands::FundProject {
+            vendor_key,
+            co_signer,
+            ..
+        } => (vendor_key.clone(), co_signer.clone()),
+        _ => (None, vec![]),
+    };
+    let deposit_project = matches!(&cli.command, Commands::DepositProject { .. });
+    let reuse_treasury = match &cli.command {
+        Commands::DepositProject { reuse_treasury, .. } => reuse_treasury.clone(),
+        Commands::FundProject { treasury_utxo, .. } => treasury_utxo.clone(),
+        _ => None,
+    };
+    // Dispatch offline work before constructing any portal/node clients.
+    if let Commands::Airgap { cmd } = cli.command {
+        return airgap_cli::run(cmd);
+    }
     anyhow::ensure!(
         cli.testnet_magic
             .is_none_or(|m| m == cli.network.testnet_magic()),
@@ -478,6 +701,250 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
+        Commands::CloneProject {
+            vendor_label,
+            ada_per_milestone,
+            project_id,
+            source,
+            interval_minutes,
+            token_policy,
+            token_name,
+            out,
+        } => {
+            anyhow::ensure!(
+                cli.network.network_id() == 0,
+                "project schedule cloning is preview-only"
+            );
+            let snapshot = serde_json::from_slice(&std::fs::read(source)?)?;
+            let mut template = if let Some(ada) = ada_per_milestone {
+                minos::project_template::clone_project_ada(
+                    &snapshot,
+                    interval_minutes,
+                    Utc::now().timestamp_millis() as u64,
+                    ada,
+                )?
+            } else {
+                minos::project_template::clone_project(
+                    &snapshot,
+                    interval_minutes,
+                    Utc::now().timestamp_millis() as u64,
+                    token_policy,
+                    token_name,
+                )?
+            };
+            if let Some(id) = project_id {
+                anyhow::ensure!(!id.trim().is_empty(), "project identifier cannot be empty");
+                template.project = id;
+            }
+            if let Some(label) = vendor_label {
+                anyhow::ensure!(!label.trim().is_empty(), "vendor label cannot be empty");
+                template.vendor_label = label;
+            }
+            minos::airgap::write_new(&out, &template)?;
+            println!("{}", serde_json::to_string_pretty(&template)?);
+            println!(
+                "Wrote {}. M0 unlocks immediately; fund promptly.",
+                out.display()
+            );
+            Ok(())
+        }
+        Commands::FundProject {
+            vendor_key: _,
+            co_signer: _,
+            change_addr,
+            treasury_utxo: _,
+            instance,
+            template,
+            fee_addr,
+            admin_key,
+            out,
+        }
+        | Commands::DepositProject {
+            change_addr,
+            reuse_treasury: _,
+            instance,
+            template,
+            fee_addr,
+            admin_key,
+            out,
+        } => {
+            let project: minos::project_template::ProjectTemplate =
+                serde_json::from_slice(&std::fs::read(&template)?)?;
+            cmd_fund(
+                &portal,
+                &ds,
+                &instance,
+                &project.project,
+                &project.label,
+                &project.description,
+                &project.vendor_label,
+                &template,
+                &fee_addr,
+                &admin_key,
+                project.token_policy.as_deref(),
+                project.token_name.as_deref(),
+                Some(&out),
+                cli.network.network_id(),
+                deposit_project,
+                reuse_treasury.as_deref(),
+                change_addr.as_deref(),
+                fund_vendor_key.as_deref(),
+                &fund_co_signers,
+            )
+            .await
+        }
+        Commands::PortalClient { out } => {
+            let root = if cli.network.network_id() == 1 {
+                "https://treasury.sundae.fi/"
+            } else {
+                "https://treasury.preview.sundae.fi/"
+            };
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?;
+            let html = client
+                .get(root)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            let script = html
+                .split("<script")
+                .find(|s| s.contains("type=\"module\""))
+                .and_then(|s| s.split("src=\"").nth(1))
+                .and_then(|s| s.split('"').next())
+                .context("public module script not found")?;
+            let url = reqwest::Url::parse(root)?.join(script)?;
+            anyhow::ensure!(url.scheme() == "https", "client script must use HTTPS");
+            let source = client
+                .get(url.clone())
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            std::fs::create_dir(&out).context("output directory must not already exist")?;
+            std::fs::write(out.join("index.html"), html)?;
+            std::fs::write(out.join("client.js"), source)?;
+            println!("Saved public portal client from {url} to {}", out.display());
+            Ok(())
+        }
+        Commands::PortalQuery {
+            query,
+            variables,
+            out,
+        } => {
+            let variables = variables
+                .map(|p| -> Result<serde_json::Value> {
+                    Ok(serde_json::from_slice(&std::fs::read(p)?)?)
+                })
+                .transpose()?;
+            let value = portal.query(&query, variables).await?;
+            if let Some(out) = out {
+                minos::airgap::write_new(&out, &value)?;
+                println!("Wrote {}", out.display());
+            } else {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            }
+            Ok(())
+        }
+        Commands::Utxos { address } => {
+            for u in ds.address_utxos(&address).await? {
+                println!(
+                    "{}",
+                    serde_json::json!({"tx":u.tx_hash,"index":u.tx_index,
+                    "lovelace":u.lovelace(),"assets":u.asset_list})
+                );
+            }
+            Ok(())
+        }
+        Commands::Airgap { cmd } => airgap_cli::run(cmd),
+        Commands::Evidence {
+            cmd: EvidenceCmd::PreparePackage { tx, file, out },
+        } => {
+            anyhow::ensure!(!out.exists(), "output already exists");
+            use std::io::Read;
+            let mut nonce = [0; 16];
+            std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+            let metadata = std::fs::metadata(&file)?;
+            anyhow::ensure!(metadata.len() <= 10 * 1024 * 1024, "PDF exceeds 10 MiB");
+            let package = minos::airgap::Package::prepare(
+                read_cbor_hex(&tx)?,
+                file.file_name()
+                    .and_then(|s| s.to_str())
+                    .context("invalid PDF filename")?
+                    .to_owned(),
+                std::fs::read(&file)?,
+                cli.network.network_id(),
+                hex::encode(nonce),
+                portal.server_timestamp().await?,
+            )?;
+            minos::airgap::write_new(&out, &package)?;
+            println!("{}", serde_json::to_string_pretty(&package.review()?)?);
+            println!(
+                "Wrote {}. No keys loaded, upload or submission performed.",
+                out.display()
+            );
+            Ok(())
+        }
+        Commands::Evidence {
+            cmd:
+                EvidenceCmd::UploadPackage {
+                    package,
+                    signed,
+                    receipt,
+                    out,
+                },
+        } => {
+            let package: minos::airgap::Package = serde_json::from_slice(&std::fs::read(package)?)?;
+            anyhow::ensure!(
+                package.network == cli.network.network_id(),
+                "package/CLI network mismatch"
+            );
+            let signed = serde_json::from_slice(&std::fs::read(signed)?)?;
+            minos::airgap::upload_package(&portal, &package, &signed, &receipt, &out).await?;
+            println!(
+                "PDF uploaded; CID verified. Wrote {} and {}. Transaction not submitted.",
+                receipt.display(),
+                out.display()
+            );
+            Ok(())
+        }
+        Commands::Assemble {
+            tx,
+            witness,
+            expected_body_hash,
+            required_signer,
+            out,
+        } => {
+            let hash: [u8; 32] = hex::decode(expected_body_hash)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("expected 32-byte body hash"))?;
+            let signer: [u8; 28] = hex::decode(required_signer)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("expected 28-byte signer hash"))?;
+            let assembled = tx::sign::assemble_witness(
+                &hex::decode(read_cbor_hex(&tx)?)?,
+                &std::fs::read_to_string(witness)?,
+                &hash,
+                &signer,
+            )?;
+            let envelope = serde_json::json!({"type": "Witnessed Tx ConwayEra",
+                "description": "Verified airgap witness", "cborHex": hex::encode(assembled)});
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out)?;
+            file.write_all(serde_json::to_string_pretty(&envelope)?.as_bytes())?;
+            println!(
+                "Verified and assembled {}: {}",
+                out.display(),
+                hex::encode(hash)
+            );
+            Ok(())
+        }
         Commands::Preflight { tx } => {
             let cbor = read_cbor_hex(&tx)?;
             let proto = ds.protocol_params().await?;
@@ -492,17 +959,48 @@ async fn main() -> Result<()> {
             println!("Withdrawal preflight passed: {} redeemers, {} memory, {} steps. This is not full ledger validation.", report.redeemers, report.memory, report.steps);
             Ok(())
         }
+        Commands::Evidence {
+            cmd: EvidenceCmd::Cid { file },
+        } => {
+            println!("{}", minos::evidence::file_url(&file)?);
+            Ok(())
+        }
         Commands::Instances => cmd_instances(&portal).await,
         Commands::Status { instance } => cmd_status(&portal, &instance).await,
         Commands::Complete {
+            publish_tx,
             instance,
             project,
             milestone,
             description,
             evidence_urls,
+            evidence_labels,
+            evidence_files,
+            portal_fees,
             fee_addr,
             out,
         } => {
+            let mut evidence_urls = evidence_urls;
+            anyhow::ensure!(
+                evidence_labels.is_empty() || evidence_labels.len() == evidence_urls.len(),
+                "provide one --evidence-label for each --evidence-url, or omit labels"
+            );
+            let mut evidence_labels = if evidence_labels.is_empty() {
+                vec![String::new(); evidence_urls.len()]
+            } else {
+                evidence_labels
+            };
+            for path in evidence_files {
+                let url = minos::evidence::file_url(&path)?;
+                eprintln!("{}: {url} (CIDv1 raw; file not uploaded)", path.display());
+                evidence_urls.push(url);
+                evidence_labels.push(
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .context("invalid evidence filename")?
+                        .to_owned(),
+                );
+            }
             cmd_complete(
                 &portal,
                 &ds,
@@ -511,9 +1009,13 @@ async fn main() -> Result<()> {
                 &milestone,
                 &description,
                 &evidence_urls,
-                &fee_addr,
+                &evidence_labels,
+                fee_addr.as_deref(),
+                portal_fees,
+                publish_tx.as_deref(),
                 out.as_deref(),
                 cli.network.network_id(),
+                cli.network.genesis_offset_secs(),
             )
             .await
         }
@@ -602,11 +1104,13 @@ async fn main() -> Result<()> {
             tx,
             label,
             portal_only,
-        } => cmd_submit(&portal, &ds, &tx, &label, portal_only).await,
+            via_portal,
+        } => cmd_submit(&portal, &ds, &tx, &label, portal_only, via_portal).await,
         Commands::Wallet { cmd } => cmd_wallet(&ds, cmd, cli.network.network_id()).await,
         Commands::Publish {
             fee_addr,
             admin_key,
+            admin_threshold,
             expiry,
             payout_upperbound,
             vendor_expiry,
@@ -618,6 +1122,7 @@ async fn main() -> Result<()> {
                 &ds,
                 &fee_addr,
                 &admin_key,
+                admin_threshold,
                 &expiry,
                 &payout_upperbound,
                 &vendor_expiry,
@@ -656,6 +1161,11 @@ async fn main() -> Result<()> {
                 token_name.as_deref(),
                 out.as_deref(),
                 cli.network.network_id(),
+                false,
+                None,
+                None,
+                None,
+                &[],
             )
             .await
         }
@@ -665,6 +1175,7 @@ async fn main() -> Result<()> {
             ticker,
             decimals,
             amount,
+            existing_asset,
             dest_addr,
             out,
         } => {
@@ -676,6 +1187,7 @@ async fn main() -> Result<()> {
                 &ticker,
                 decimals,
                 amount,
+                existing_asset,
                 dest,
                 out.as_deref(),
                 cli.network.network_id(),
@@ -795,6 +1307,7 @@ const PUBLISH_FEE: u64 = 3_000_000;
 /// 1. Size fee:       min_fee_a * tx_bytes + min_fee_b
 /// 2. Execution fee:  ceil(price_mem * total_mem + price_step * total_steps)
 /// 3. Ref script fee: ref_script_cost_per_byte * total_ref_script_bytes
+#[allow(clippy::too_many_arguments)]
 fn calc_min_fee(
     cbor_hex: &str,
     proto: &koios::ProtocolParams,
@@ -818,6 +1331,34 @@ fn calc_min_fee(
     size_fee + exec_fee + ref_fee
 }
 
+type VendorStakingAuthorization = (Vec<[u8; 28]>, Vec<references::OutRef>);
+
+fn vendor_staking_authorization(
+    vendor: &types::MultisigScript,
+) -> Result<VendorStakingAuthorization> {
+    let hashes = vendor
+        .script_hashes()
+        .into_iter()
+        .map(|hash| {
+            hash.try_into()
+                .map_err(|_| anyhow::anyhow!("script hash must be 28 bytes"))
+        })
+        .collect::<Result<Vec<[u8; 28]>>>()?;
+    let refs = hashes
+        .iter()
+        .map(|hash| match hex::encode(hash).as_str() {
+            "326cec60e7bcf3673b02f8684802febdcf27cad1601d75182ad6a5bb" => Ok((
+                "aaec1b8402f1d7951a86a13ed05114baf32549841a5c288d8580b367bb5063c8".into(),
+                0,
+            )),
+            other => anyhow::bail!(
+                "unknown staking script hash {other}; add its reference UTxO to the table"
+            ),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((hashes, refs))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_complete(
     portal: &Portal,
@@ -827,9 +1368,13 @@ async fn cmd_complete(
     milestone: &str,
     description: &str,
     evidence_urls: &[String],
-    fee_addr: &str,
+    evidence_labels: &[String],
+    fee_addr: Option<&str>,
+    portal_fees: bool,
+    publish_tx: Option<&str>,
     out: Option<&std::path::Path>,
     network_id: u8,
+    genesis_offset_secs: u64,
 ) -> Result<()> {
     // 1. Fetch instance + project data from portal
     let inst = portal.instance_by_id(instance).await?;
@@ -856,6 +1401,14 @@ async fn cmd_complete(
     let vendor_key_hashes = datum.vendor.key_hashes();
     let num_vendor_keys = vendor_key_hashes.len() as u64;
 
+    let (staking_script_hashes, staking_script_refs) = vendor_staking_authorization(&datum.vendor)?;
+    let staking_expected: Vec<_> = staking_script_refs
+        .iter()
+        .cloned()
+        .zip(staking_script_hashes.iter().map(hex::encode))
+        .collect();
+    let staking_count = staking_script_hashes.len() as u64;
+
     // 3. Extract vendor UTxO value
     let vendor_value_lovelace = output
         .value
@@ -871,7 +1424,55 @@ async fn cmd_complete(
         .collect();
 
     // 4. Fetch wallet UTxOs
-    let utxos = koios.address_utxos(fee_addr).await?;
+    let (sponsored_addr, sponsored_utxos) = if portal_fees {
+        let rows = portal.fee_inputs().await?;
+        let mut available = Vec::new();
+        for row in rows {
+            if row.available_at(Utc::now())? {
+                available.push(row);
+            }
+        }
+        let address = available
+            .first()
+            .context("no unreserved portal fee inputs")?
+            .address
+            .clone();
+        anyhow::ensure!(
+            available.iter().all(|r| r.address == address),
+            "portal fee inputs use different addresses"
+        );
+        let live = koios.address_utxos(&address).await?;
+        let live = minos::portal::sponsored_utxos(&available, live, &address, Utc::now())?;
+        anyhow::ensure!(
+            live.len() >= 2,
+            "need two live unreserved ADA-only portal fee inputs for fee and collateral"
+        );
+        (Some(address), Some(live))
+    } else {
+        (None, None)
+    };
+    let fee_addr = sponsored_addr
+        .as_deref()
+        .or(fee_addr)
+        .context("missing fee address")?;
+    let fee_key_hash = if portal_fees {
+        let address = pallas_addresses::Address::from_bech32(fee_addr)?.to_vec();
+        anyhow::ensure!(
+            matches!(address[0] >> 4, 0 | 2 | 4 | 6) && address.len() >= 29,
+            "portal fee address must use a payment key"
+        );
+        anyhow::ensure!(
+            address[0] & 15 == network_id,
+            "fee address belongs to another network"
+        );
+        Some(address[1..29].to_vec())
+    } else {
+        None
+    };
+    let utxos = match sponsored_utxos {
+        Some(utxos) => utxos,
+        None => koios.address_utxos(fee_addr).await?,
+    };
     let wallet_utxos: Vec<coin_select::WalletUtxo> =
         utxos.iter().map(coin_select::WalletUtxo::from).collect();
 
@@ -886,8 +1487,11 @@ async fn cmd_complete(
     // 6. Coin selection
     let (selected, _) = coin_select::select_inputs(&wallet_utxos, ESTIMATED_FEE + MIN_CHANGE)?;
     let total_fee_selected: u64 = selected.iter().map(|u| u.lovelace).sum();
-    let fee_input_hashes: Vec<&str> = selected.iter().map(|u| u.tx_hash.as_str()).collect();
-    let collateral = coin_select::select_collateral(&wallet_utxos, &fee_input_hashes)?;
+    let fee_refs: Vec<_> = selected
+        .iter()
+        .map(|u| (u.tx_hash.clone(), u.output_index))
+        .collect();
+    let collateral = coin_select::select_separate_collateral(&wallet_utxos, &fee_refs)?;
 
     // 7. Script reference inputs + registry NFT
     let vendor_ref = inst
@@ -895,19 +1499,21 @@ async fn cmd_complete(
         .vendor_script
         .script_reference
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("vendor script has no scriptReference"))?;
-    let treasury_ref = inst
-        .registry
-        .treasury_script
-        .script_reference
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("treasury script has no scriptReference"))?;
-    // Registry NFT is at index 0 of the same publish tx as the script refs
-    let registry_utxo_hash = vendor_ref.transaction.clone();
-    let registry_utxo_index = 0u64;
+        .map(|r| (r.transaction.clone(), r.index))
+        .or_else(|| publish_tx.map(|h| (h.to_owned(), 2)))
+        .context("vendor script has no scriptReference; provide --publish-tx")?;
+    // Live deployments can publish registry and reference scripts independently.
+    let registries = koios.asset_utxos(instance, "5245474953545259").await?;
+    anyhow::ensure!(
+        registries.len() == 1,
+        "expected one live REGISTRY NFT output, got {}",
+        registries.len()
+    );
+    let registry_utxo_hash = registries[0].tx_hash.clone();
+    let registry_utxo_index = registries[0].tx_index;
 
     // 8. Validity interval
-    let valid_from_slot = tip.abs_slot.saturating_sub(120);
+    let valid_from_slot = tx::complete::validity_start(tip.abs_slot, genesis_offset_secs, &datum);
     let invalid_from_slot = tip.abs_slot + 7200;
 
     // 9. Build params — two passes: first to measure tx size, then with exact fee
@@ -920,11 +1526,14 @@ async fn cmd_complete(
         vendor_value_assets,
         registry_utxo_hash,
         registry_utxo_index,
-        vendor_script_ref_hash: vendor_ref.transaction.clone(),
-        vendor_script_ref_index: vendor_ref.index,
-        treasury_script_ref_hash: treasury_ref.transaction.clone(),
-        treasury_script_ref_index: treasury_ref.index,
+        vendor_script_ref_hash: vendor_ref.0.clone(),
+        vendor_script_ref_index: vendor_ref.1,
         vendor_key_hashes,
+        fee_key_hash,
+        staking_script_hashes,
+        staking_script_refs,
+        staking_reward_mem: 2_500_000,
+        staking_reward_steps: 900_000_000,
         fee_inputs: selected.iter().map(|u| (*u).clone()).collect(),
         collateral: collateral.clone(),
         fee_addr: fee_addr.to_string(),
@@ -938,19 +1547,20 @@ async fn cmd_complete(
         milestone_id: milestone.to_string(),
         description: description.to_string(),
         evidence_urls: evidence_urls.to_vec(),
+        evidence_labels: evidence_labels.to_vec(),
         network_id,
     };
     // Fetch ref script sizes for accurate fee calculation
-    let ref_utxos = references::treasury_references(
+    // Complete uses the vendor Withdraw redeemer; the treasury is not executed.
+    let ref_utxos = references::withdrawal_references(
         koios,
         instance,
         (
             params.registry_utxo_hash.clone(),
             params.registry_utxo_index,
         ),
-        (vendor_ref.transaction.clone(), vendor_ref.index),
-        (treasury_ref.transaction.clone(), treasury_ref.index),
-        &[],
+        vendor_ref,
+        &staking_expected,
     )
     .await?;
     let ref_script_bytes = references::total_script_bytes(&ref_utxos)?;
@@ -962,18 +1572,48 @@ async fn cmd_complete(
         &proto,
         3_000_000,
         800_000_000,
-        0,
-        0,
+        params.staking_reward_mem * staking_count,
+        params.staking_reward_steps * staking_count,
         ref_script_bytes,
         num_vendor_keys + 1,
     );
     params.change_lovelace = total_fee_selected.saturating_sub(params.fee);
-    eprintln!("tx fee: {:.4} ADA", params.fee as f64 / 1_000_000.0);
+    eprintln!(
+        "tx fee: {} lovelace ({:.6} ADA)",
+        params.fee,
+        params.fee as f64 / 1_000_000.0
+    );
 
     let unsigned_tx = tx::complete::build(params)?;
+    let report = minos::preflight::withdrawal(
+        koios,
+        &unsigned_tx.cbor_hex,
+        &proto,
+        genesis_offset_secs,
+        &ref_utxos,
+    )
+    .await
+    .context("completion preflight failed; unsigned file was not written")?;
+    eprintln!(
+        "Completion preflight passed: {} redeemers, {} memory, {} steps",
+        report.redeemers, report.memory, report.steps
+    );
+    eprintln!(
+        "Transaction body hash: {}",
+        hex::encode(tx::sign::tx_body_hash(&hex::decode(
+            &unsigned_tx.cbor_hex
+        )?)?)
+    );
+    eprintln!("Fee/change address: {fee_addr}");
+    eprintln!(
+        "Valid until: {}",
+        ms_to_utc((invalid_from_slot + genesis_offset_secs) * 1000)
+    );
+    eprintln!("Validity end slot: {invalid_from_slot}; no signing or submission performed");
     write_tx(unsigned_tx, out)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_withdraw(
     portal: &Portal,
     koios: &DataSource,
@@ -1008,33 +1648,7 @@ async fn cmd_withdraw(
     let vendor_key_hashes = datum.vendor.key_hashes();
     let num_vendor_keys = vendor_key_hashes.len() as u64;
 
-    // Extract Script multisig hashes (allowlist_vendor staking validators).
-    // Map known hashes to their on-chain reference script UTxOs.
-    let staking_script_hashes: Vec<[u8; 28]> = datum
-        .vendor
-        .script_hashes()
-        .into_iter()
-        .map(|h| {
-            h.try_into()
-                .map_err(|_| anyhow::anyhow!("script hash must be 28 bytes"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let staking_script_refs: Vec<(String, u64)> = staking_script_hashes
-        .iter()
-        .map(|h| {
-            let h_hex = hex::encode(h);
-            match h_hex.as_str() {
-                // SundaeSwap allowlist_vendor for Se7en Labs instance
-                "326cec60e7bcf3673b02f8684802febdcf27cad1601d75182ad6a5bb" => Ok((
-                    "aaec1b8402f1d7951a86a13ed05114baf32549841a5c288d8580b367bb5063c8".to_string(),
-                    0u64,
-                )),
-                other => anyhow::bail!(
-                    "unknown staking script hash {other}; add its reference UTxO to the table"
-                ),
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let (staking_script_hashes, staking_script_refs) = vendor_staking_authorization(&datum.vendor)?;
     let staking_reward_mem: u64 = 2_500_000 * staking_script_hashes.len() as u64;
     let staking_reward_steps: u64 = 900_000_000 * staking_script_hashes.len() as u64;
 
@@ -1116,12 +1730,11 @@ async fn cmd_withdraw(
 
     // Re-partition using the exact same predicate the Plutus script applies,
     // so our datum and value split always agrees with what the script enforces.
-    let (matured_indexed, remaining_indexed): (
-        Vec<(usize, &types::Payout)>,
-        Vec<(usize, &types::Payout)>,
-    ) = datum.payouts.iter().enumerate().partition(|(_, p)| {
-        matches!(p.status, types::PayoutStatus::Active) && p.maturation < valid_from_posix_ms
-    });
+    type IndexedPayout<'a> = (usize, &'a types::Payout);
+    let (matured_indexed, remaining_indexed): (Vec<IndexedPayout<'_>>, Vec<IndexedPayout<'_>>) =
+        datum.payouts.iter().enumerate().partition(|(_, p)| {
+            matches!(p.status, types::PayoutStatus::Active) && p.maturation < valid_from_posix_ms
+        });
 
     let matured: Vec<types::Payout> = matured_indexed
         .iter()
@@ -1413,7 +2026,7 @@ async fn cmd_adjudicate(
     let parse_indices = |s: Option<&str>| -> Result<std::collections::HashSet<usize>> {
         match s {
             None => Ok(std::collections::HashSet::new()),
-            Some(s) if s.is_empty() => Ok(std::collections::HashSet::new()),
+            Some("") => Ok(std::collections::HashSet::new()),
             Some(s) => s
                 .split(',')
                 .map(|t| t.trim().parse::<usize>().context("index must be a number"))
@@ -2046,9 +2659,17 @@ async fn cmd_wallet(koios: &DataSource, cmd: WalletCmd, network_id: u8) -> Resul
             }
         }
 
-        WalletCmd::Address { wallet, account } => {
+        WalletCmd::Address {
+            wallet,
+            account,
+            base,
+        } => {
             let mnemonic = load_wallet(wallet.as_deref())?;
-            let addr = wallet::enterprise_address(&mnemonic, account, network_id);
+            let addr = if base {
+                wallet::base_address(&mnemonic, account, network_id)
+            } else {
+                wallet::enterprise_address(&mnemonic, account, network_id)
+            };
             let key_hash = wallet::payment_key_hash(&mnemonic, account);
             println!("Account:   {account}");
             println!(
@@ -2058,6 +2679,117 @@ async fn cmd_wallet(koios: &DataSource, cmd: WalletCmd, network_id: u8) -> Resul
             println!("Key hash:  {}", hex::encode(*key_hash));
         }
 
+        WalletCmd::Send {
+            from,
+            to,
+            ada,
+            outputs,
+            out,
+        } => {
+            use pallas_crypto::hash::Hash;
+            use pallas_txbuilder::{BuildConway, Input, Output, StagingTransaction};
+            let source = pallas_addresses::Address::from_bech32(&from)?;
+            let destination = pallas_addresses::Address::from_bech32(&to)?;
+            let source_bytes = source.to_vec();
+            let destination_bytes = destination.to_vec();
+            anyhow::ensure!(
+                source_bytes.len() >= 29 && matches!(source_bytes[0] >> 4, 0 | 2 | 6),
+                "source must have a payment key credential"
+            );
+            anyhow::ensure!(
+                source_bytes[0] & 15 == network_id && destination_bytes[0] & 15 == network_id,
+                "address network mismatch"
+            );
+            anyhow::ensure!(
+                outputs > 0 && outputs <= 100 && ada > 0,
+                "provide 1..100 positive ADA outputs"
+            );
+            let amount = ada.checked_mul(1_000_000).context("ADA amount overflow")?;
+            let total = amount
+                .checked_mul(u64::from(outputs))
+                .context("output total overflow")?;
+            let target = total
+                .checked_add(ESTIMATED_FEE + MIN_CHANGE)
+                .context("transfer total overflow")?;
+            let candidates: Vec<_> = koios
+                .address_utxos(&from)
+                .await?
+                .iter()
+                .filter(|u| !u.has_native_assets())
+                .map(coin_select::WalletUtxo::from)
+                .collect();
+            let (selected, _) = coin_select::select_inputs(&candidates, target)?;
+            let input_total: u64 = selected.iter().map(|u| u.lovelace).sum();
+            let tip = koios.tip().await?;
+            let mut staging = StagingTransaction::new()
+                .fee(ESTIMATED_FEE)
+                .valid_from_slot(tip.abs_slot.saturating_sub(120))
+                .invalid_from_slot(tip.abs_slot + 7200)
+                .network_id(network_id)
+                .disclosed_signer(Hash::from(<[u8; 28]>::try_from(&source_bytes[1..29])?));
+            for _ in 0..outputs {
+                staging = staging.output(Output::new(destination.clone(), amount));
+            }
+            staging = staging.output(Output::new(source, input_total - total - ESTIMATED_FEE));
+            for input in selected {
+                staging = staging.input(Input::new(
+                    Hash::from(<[u8; 32]>::try_from(
+                        hex::decode(&input.tx_hash)?.as_slice(),
+                    )?),
+                    input.output_index,
+                ));
+            }
+            let built = staging
+                .build_conway_raw()
+                .map_err(|e| anyhow::anyhow!("build wallet transfer: {e}"))?;
+            anyhow::ensure!(!out.exists(), "output already exists");
+            write_tx(
+                tx::UnsignedTx::new("ADA wallet transfer", hex::encode(built.tx_bytes.0)),
+                Some(&out),
+            )?;
+        }
+        WalletCmd::Fetch { hash, out } => {
+            anyhow::ensure!(
+                hex::decode(&hash)?.len() == 32,
+                "transaction hash must be 32 bytes"
+            );
+            let cbor = match koios {
+                DataSource::Koios(client) => client.transaction_cbor(&hash).await?,
+                DataSource::Node(_) => {
+                    anyhow::bail!("historical transaction fetch requires the Koios HTTP backend")
+                }
+            };
+            let bytes = hex::decode(&cbor)?;
+            let actual = hex::encode(tx::sign::tx_body_hash(&bytes)?);
+            anyhow::ensure!(
+                actual == hash.to_lowercase(),
+                "provider returned a different transaction body"
+            );
+            minos::airgap::write_new(
+                &out,
+                &serde_json::json!({"type":"Tx ConwayEra",
+                "description":"Confirmed transaction fetched from Koios", "cborHex":cbor}),
+            )?;
+            println!("Fetched and verified {actual} to {}", out.display());
+        }
+        WalletCmd::Inspect { tx: path } => {
+            let bytes = hex::decode(read_cbor_hex(&path)?)?;
+            let decoded: pallas_primitives::conway::Tx<'_> =
+                pallas_codec::minicbor::decode(&bytes)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "txId":hex::encode(tx::sign::tx_body_hash(&bytes)?),
+                    "bytes":bytes.len(),
+                    "outputAddresses":decoded.transaction_body.outputs.iter().map(|o| -> Result<String> {
+                        Ok(pallas_traverse::MultiEraOutput::from_conway(o).address()?.to_bech32()?)
+                    }).collect::<Result<Vec<_>>>()?,
+                    "body":decoded.transaction_body,
+                    "metadata":decoded.auxiliary_data,
+                    "vkeyWitnesses":decoded.transaction_witness_set.vkeywitness
+                }))?
+            );
+        }
         WalletCmd::Submit { tx } => cmd_wallet_submit(koios, &tx).await?,
 
         WalletCmd::Sign {
@@ -2117,7 +2849,8 @@ fn load_wallet(path: Option<&std::path::Path>) -> Result<bip39::Mnemonic> {
 async fn cmd_publish(
     koios: &DataSource,
     fee_addr: &str,
-    admin_key_hex: &str,
+    admin_key_hex: &[String],
+    admin_threshold: u64,
     expiry: &str,
     payout_upperbound: &str,
     vendor_expiry: &str,
@@ -2127,11 +2860,12 @@ async fn cmd_publish(
     network_id: u8,
 ) -> Result<()> {
     // Parse admin key hash
-    let admin_key_hash = hex::decode(admin_key_hex.trim()).context("admin_key must be hex")?;
-    anyhow::ensure!(
-        admin_key_hash.len() == 28,
-        "admin_key must be 28 bytes (56 hex chars)"
-    );
+    let admin_keys: Vec<_> = admin_key_hex
+        .iter()
+        .map(|s| hex::decode(s.trim()))
+        .collect::<std::result::Result<_, _>>()?;
+    tx::publish::admin_permission(&admin_keys, admin_threshold)?;
+    let admin_key_hash = admin_keys[0].clone();
 
     // Parse timestamps
     let expiration_ms = parse_time_ms(expiry)?;
@@ -2166,8 +2900,11 @@ async fn cmd_publish(
     let extra_fee_inputs: Vec<coin_select::WalletUtxo> =
         selected[1..].iter().map(|u| (*u).clone()).collect();
 
-    let fee_input_hashes: Vec<&str> = selected.iter().map(|u| u.tx_hash.as_str()).collect();
-    let collateral = coin_select::select_collateral(&wallet_utxos, &fee_input_hashes)?;
+    let fee_inputs: Vec<_> = selected
+        .iter()
+        .map(|u| (u.tx_hash.clone(), u.output_index))
+        .collect();
+    let collateral = coin_select::select_separate_collateral(&wallet_utxos, &fee_inputs)?;
 
     let valid_from_slot = tip.abs_slot.saturating_sub(120);
     // 2-hour window keeps slot-to-time translation within the era horizon for Plutus
@@ -2177,6 +2914,8 @@ async fn cmd_publish(
         seed_utxo_hash: seed.tx_hash.clone(),
         seed_utxo_index: seed.output_index,
         admin_key_hash,
+        admin_keys,
+        admin_threshold,
         expiration_ms,
         payout_upperbound_ms,
         vendor_expiration_ms,
@@ -2201,17 +2940,7 @@ async fn cmd_publish(
 // Milestone JSON schema (for --milestones file in fund command)
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Deserialize)]
-struct MilestoneJson {
-    id: String,
-    label: String,
-    description: Option<String>,
-    maturation_ms: u64,
-    #[serde(default)]
-    lovelace: u64,
-    #[serde(default)]
-    token_amount: u64,
-}
+type MilestoneJson = minos::project_template::Milestone;
 
 #[allow(clippy::too_many_arguments)]
 async fn cmd_fund(
@@ -2229,14 +2958,41 @@ async fn cmd_fund(
     token_name_hex: Option<&str>,
     out: Option<&std::path::Path>,
     network_id: u8,
+    deposit: bool,
+    reuse_treasury: Option<&str>,
+    change_addr: Option<&str>,
+    vendor_key_hex: Option<&str>,
+    co_signer_hex: &[String],
 ) -> Result<()> {
+    let vendor_key_hash = vendor_key_hex.map(hex::decode).transpose()?;
+    let co_signer_hashes: Vec<Vec<u8>> = co_signer_hex
+        .iter()
+        .map(hex::decode)
+        .collect::<std::result::Result<_, _>>()?;
+    for key in co_signer_hashes.iter().chain(vendor_key_hash.iter()) {
+        anyhow::ensure!(
+            key.len() == 28,
+            "vendor and co-signer keys must be 28 bytes"
+        );
+    }
+    if let Some(change) = change_addr {
+        let from = pallas_addresses::Address::from_bech32(fee_addr)?.to_vec();
+        let to = pallas_addresses::Address::from_bech32(change)?.to_vec();
+        anyhow::ensure!(from.len()>=29 && to.len()>=29 && from[0]&15==to[0]&15
+            && from[1..29]==to[1..29] && to[0]>>4==0,
+            "change address must be a base key address with the same payment credential and network");
+    }
     // Parse inputs
     let admin_key_hash = hex::decode(admin_key_hex.trim()).context("admin_key hex")?;
     anyhow::ensure!(admin_key_hash.len() == 28, "admin_key must be 28 bytes");
 
-    let milestone_specs: Vec<MilestoneJson> =
-        serde_json::from_str(&std::fs::read_to_string(milestones_path)?)
-            .context("milestones JSON")?;
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(milestones_path)?)?;
+    let milestone_specs: Vec<MilestoneJson> = serde_json::from_value(if raw.is_array() {
+        raw
+    } else {
+        raw["milestones"].clone()
+    })
+    .context("milestones JSON")?;
     anyhow::ensure!(!milestone_specs.is_empty(), "milestones list is empty");
 
     let token_policy: Option<Vec<u8>> = token_policy_hex
@@ -2251,6 +3007,11 @@ async fn cmd_fund(
 
     let total_token_needed: u64 = milestone_specs.iter().map(|m| m.token_amount).sum();
     let total_lovelace_needed: u64 = milestone_specs.iter().map(|m| m.lovelace).sum();
+    anyhow::ensure!(
+        reuse_treasury.is_none() || !deposit || total_token_needed == 0,
+        "treasury deposit reuse supports ADA-only initialization"
+    );
+    let spends_treasury = !deposit || reuse_treasury.is_some();
 
     // Fetch portal instance for vendor script hash
     let inst = portal.instance_by_id(instance).await?;
@@ -2262,8 +3023,41 @@ async fn cmd_fund(
     );
 
     // Fetch wallet UTxOs from Koios
-    let utxos = koios.address_utxos(fee_addr).await?;
-    anyhow::ensure!(!utxos.is_empty(), "no UTxOs at {fee_addr}");
+    let wallet_utxos = koios.address_utxos(fee_addr).await?;
+    anyhow::ensure!(!wallet_utxos.is_empty(), "no UTxOs at {fee_addr}");
+    let treasury_hash: [u8; 28] = hex::decode(&inst.registry.treasury_script.script_hash)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid treasury hash"))?;
+    let treasury_address = minos::scripts::base_script_addr(
+        &pallas_crypto::hash::Hash::from(treasury_hash),
+        network_id,
+    )
+    .to_bech32()?;
+    let mut utxos = if !spends_treasury {
+        wallet_utxos.clone()
+    } else {
+        koios
+            .address_utxos(&treasury_address)
+            .await?
+            .into_iter()
+            .filter(|u| u.reference_script.is_none())
+            .collect()
+    };
+    if let Some(reference) = reuse_treasury {
+        let (hash, index) = parse_utxo_ref(reference)?;
+        utxos.retain(|u| u.tx_hash == hash && u.tx_index == index);
+        anyhow::ensure!(
+            utxos.len() == 1,
+            "requested treasury deposit is not unspent at this budget"
+        );
+        if deposit {
+            anyhow::ensure!(
+                utxos[0].lovelace() == total_lovelace_needed.max(10_000_000)
+                    && !utxos[0].has_native_assets(),
+                "reused deposit must match the exact ADA amount"
+            );
+        }
+    }
 
     // Select inputs: prefer UTxOs with the right tokens, then fill ADA from the rest.
     let mut inputs: Vec<tx::fund::FundInput> = Vec::new();
@@ -2305,19 +3099,62 @@ async fn cmd_fund(
             total_input_tokens >= total_token_needed,
             "insufficient tokens: need {total_token_needed}, wallet has {total_input_tokens}"
         );
+    } else if spends_treasury {
+        let selected = tx::fund::select_ada_treasury_input(&utxos, total_lovelace_needed)?;
+        total_input_lovelace = selected.lovelace();
+        inputs.push(tx::fund::FundInput {
+            tx_hash: selected.tx_hash.clone(),
+            output_index: selected.tx_index,
+            lovelace: selected.lovelace(),
+            token_amount: 0,
+        });
     }
 
     // Second pass: collect additional ADA UTxOs if needed.
     // Use 10 ADA floor for vendor output (min-ADA for token UTxO with large datum).
     let vendor_floor = total_lovelace_needed.max(10_000_000);
-    let target_lovelace = vendor_floor + ESTIMATED_FEE + MIN_CHANGE;
-    let already_used: std::collections::HashSet<String> =
-        inputs.iter().map(|i| i.tx_hash.clone()).collect();
-    for u in &utxos {
+    let treasury_input = if !spends_treasury {
+        None
+    } else {
+        anyhow::ensure!(inputs.len()==1, "funding needs one treasury UTxO holding the template's assets; use deposit-project first");
+        Some((inputs[0].tx_hash.clone(), inputs[0].output_index))
+    };
+    let treasury_return_lovelace = if deposit {
+        0
+    } else {
+        total_input_lovelace
+            .checked_sub(total_lovelace_needed)
+            .context("treasury has insufficient ADA")?
+    };
+    let target_lovelace = vendor_floor + treasury_return_lovelace + ESTIMATED_FEE + MIN_CHANGE;
+    if spends_treasury {
+        utxos.extend(
+            wallet_utxos
+                .iter()
+                .filter(|u| !u.has_native_assets())
+                .cloned(),
+        );
+    }
+    let already_used: std::collections::HashSet<(String, u64)> = inputs
+        .iter()
+        .map(|i| (i.tx_hash.clone(), i.output_index))
+        .collect();
+    let fee_candidates: Vec<_> = if !spends_treasury {
+        utxos
+            .iter()
+            .filter(|u| total_token_needed > 0 || !u.has_native_assets())
+            .collect()
+    } else {
+        wallet_utxos
+            .iter()
+            .filter(|u| !u.has_native_assets())
+            .collect()
+    };
+    for u in fee_candidates {
         if total_input_lovelace >= target_lovelace {
             break;
         }
-        if already_used.contains(&u.tx_hash) {
+        if already_used.contains(&(u.tx_hash.clone(), u.tx_index)) {
             continue;
         }
         total_input_lovelace += u.lovelace();
@@ -2341,15 +3178,19 @@ async fn cmd_fund(
 
     let change_lovelace = total_input_lovelace
         .saturating_sub(vendor_lovelace_total)
+        .saturating_sub(treasury_return_lovelace)
         .saturating_sub(ESTIMATED_FEE);
-    let change_tokens = total_input_tokens.saturating_sub(total_token_needed);
+    let token_remainder = total_input_tokens.saturating_sub(total_token_needed);
+    let change_tokens = if deposit { token_remainder } else { 0 };
 
     // Collect extra (non-target) native assets from selected inputs so they go back in change.
-    let selected_hashes: std::collections::HashSet<String> =
-        inputs.iter().map(|i| i.tx_hash.clone()).collect();
+    let selected_outputs: std::collections::HashSet<(String, u64)> = inputs
+        .iter()
+        .map(|i| (i.tx_hash.clone(), i.output_index))
+        .collect();
     let mut extra_change_assets: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
     for u in &utxos {
-        if !selected_hashes.contains(&u.tx_hash) {
+        if !selected_outputs.contains(&(u.tx_hash.clone(), u.tx_index)) {
             continue;
         }
         if let Some(assets) = &u.asset_list {
@@ -2379,16 +3220,77 @@ async fn cmd_fund(
             id: m.id,
             label: m.label,
             description: m.description,
+            acceptance_criteria: m.acceptance_criteria,
+            requires_evidence: m.requires_evidence,
             maturation_ms: m.maturation_ms,
             lovelace: m.lovelace,
             token_amount: m.token_amount,
         })
         .collect();
 
+    let mut treasury = None;
+    let mut cached_references = Vec::new();
+    if let Some(input) = treasury_input {
+        let registry = koios.asset_utxos(instance, "5245474953545259").await?;
+        anyhow::ensure!(registry.len() == 1, "expected one live registry UTxO");
+        let registry_ref = (registry[0].tx_hash.clone(), registry[0].tx_index);
+        let vendor_ref = inst
+            .registry
+            .vendor_script
+            .script_reference
+            .as_ref()
+            .map(|r| (r.transaction.clone(), r.index))
+            .unwrap_or_else(|| (registry_ref.0.clone(), 2));
+        let treasury_ref = inst
+            .registry
+            .treasury_script
+            .script_reference
+            .as_ref()
+            .map(|r| (r.transaction.clone(), r.index))
+            .unwrap_or_else(|| (registry_ref.0.clone(), 1));
+        cached_references = references::treasury_references(
+            koios,
+            instance,
+            registry_ref.clone(),
+            vendor_ref,
+            treasury_ref.clone(),
+            &[],
+        )
+        .await?;
+        let fee_utxos: Vec<_> = wallet_utxos
+            .iter()
+            .map(coin_select::WalletUtxo::from)
+            .collect();
+        let collateral = tx::fund::select_funding_collateral(&fee_utxos, &inputs)?.clone();
+        let mut return_assets = std::mem::take(&mut extra_change_assets);
+        if token_remainder > 0 {
+            return_assets.push((
+                token_policy.clone().context("missing token policy")?,
+                token_name.clone().context("missing token name")?,
+                token_remainder,
+            ));
+        }
+        treasury = Some(tx::fund::TreasurySpend {
+            input,
+            references: vec![registry_ref, treasury_ref],
+            collateral,
+            cost_model: koios
+                .protocol_params()
+                .await?
+                .v3_cost_model()
+                .context("missing cost model")?,
+            return_address: treasury_address,
+            return_lovelace: treasury_return_lovelace,
+            return_assets,
+        });
+    }
     let params = tx::fund::FundParams {
+        treasury,
         instance_id: instance.to_string(),
         vendor_script_hash,
         admin_key_hash,
+        vendor_key_hash,
+        co_signer_hashes,
         project_id: project.to_string(),
         label: label.to_string(),
         description: description.to_string(),
@@ -2401,14 +3303,36 @@ async fn cmd_fund(
         change_lovelace,
         change_tokens,
         extra_change_assets,
-        fee_addr: fee_addr.to_string(),
+        fee_addr: change_addr.unwrap_or(fee_addr).to_string(),
         fee: ESTIMATED_FEE,
         valid_from_slot,
         invalid_from_slot,
         network_id,
     };
 
-    let unsigned_tx = tx::fund::build(params)?;
+    let unsigned_tx = if deposit {
+        tx::fund::build_deposit(params, &treasury_hash)?
+    } else {
+        tx::fund::build(params)?
+    };
+    if spends_treasury {
+        let report = minos::preflight::withdrawal(
+            koios,
+            &unsigned_tx.cbor_hex,
+            &koios.protocol_params().await?,
+            if network_id == 0 {
+                1_666_656_000
+            } else {
+                1_591_566_291
+            },
+            &cached_references,
+        )
+        .await?;
+        eprintln!(
+            "Funding preflight passed: {} redeemers, {} memory, {} steps",
+            report.redeemers, report.memory, report.steps
+        );
+    }
     write_tx(unsigned_tx, out)
 }
 
@@ -2420,6 +3344,7 @@ async fn cmd_mint(
     ticker: &str,
     decimals: u64,
     amount: u64,
+    existing_asset: bool,
     dest_addr: &str,
     out: Option<&std::path::Path>,
     network_id: u8,
@@ -2432,8 +3357,11 @@ async fn cmd_mint(
 
     // Token output needs 3 ADA (ref NFT + FTs in same output)
     let target = 3_000_000 + ESTIMATED_FEE + MIN_CHANGE;
-    let wallet_utxos: Vec<coin_select::WalletUtxo> =
-        utxos.iter().map(coin_select::WalletUtxo::from).collect();
+    let wallet_utxos: Vec<coin_select::WalletUtxo> = utxos
+        .iter()
+        .filter(|u| !u.has_native_assets())
+        .map(coin_select::WalletUtxo::from)
+        .collect();
     let (selected, _) = coin_select::select_inputs(&wallet_utxos, target)?;
     let total_selected: u64 = selected.iter().map(|u| u.lovelace).sum();
     let change_lovelace = total_selected
@@ -2456,6 +3384,7 @@ async fn cmd_mint(
     let params = tx::mint::MintParams {
         admin_key_hash,
         ft_amount: amount,
+        mint_reference: !existing_asset,
         token_ticker: ticker.to_string(),
         token_decimals: decimals,
         inputs,
@@ -2515,8 +3444,18 @@ async fn cmd_submit(
     tx_path: &std::path::Path,
     label: &str,
     portal_only: bool,
+    via_portal: bool,
 ) -> Result<()> {
     let cbor_hex = read_cbor_hex(tx_path)?;
+    if via_portal {
+        portal.submit_transaction(label, &cbor_hex).await?;
+        let hash = tx::sign::tx_body_hash(&hex::decode(&cbor_hex)?)?;
+        println!(
+            "Accepted by portal: {} (chain confirmation pending)",
+            hex::encode(hash)
+        );
+        return Ok(());
+    }
     if !portal_only {
         let tx_hash = koios.submit_tx(&cbor_hex).await?;
         println!("Submitted: {tx_hash}");

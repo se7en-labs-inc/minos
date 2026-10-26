@@ -28,7 +28,7 @@ pub fn select_inputs(
     target_lovelace: u64,
 ) -> Result<(Vec<&WalletUtxo>, u64)> {
     let mut candidates: Vec<&WalletUtxo> = utxos.iter().collect();
-    candidates.sort_by(|a, b| b.lovelace.cmp(&a.lovelace));
+    candidates.sort_by_key(|u| std::cmp::Reverse(u.lovelace));
 
     let mut selected = Vec::new();
     let mut total = 0u64;
@@ -53,6 +53,24 @@ pub fn select_inputs(
     }
 
     Ok((selected, total - target_lovelace))
+}
+
+/// Pick a collateral UTxO: ADA-only, >= 5 ADA.
+pub fn select_separate_collateral<'a>(
+    utxos: &'a [WalletUtxo],
+    excluded: &[(String, u64)],
+) -> Result<&'a WalletUtxo> {
+    utxos
+        .iter()
+        .filter(|u| {
+            !u.has_native_assets
+                && u.lovelace >= 5_000_000
+                && !excluded
+                    .iter()
+                    .any(|(hash, index)| *hash == u.tx_hash && *index == u.output_index)
+        })
+        .min_by_key(|u| u.lovelace)
+        .ok_or_else(|| anyhow::anyhow!("no separate ADA-only collateral UTxO"))
 }
 
 /// Pick a collateral UTxO: ADA-only, >= 5 ADA.

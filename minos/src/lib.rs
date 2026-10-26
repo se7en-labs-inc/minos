@@ -1,8 +1,12 @@
+pub mod airgap;
 pub mod coin_select;
+pub mod cose;
+pub mod evidence;
 pub mod koios;
 pub mod node;
 pub mod portal;
 pub mod preflight;
+pub mod project_template;
 pub mod references;
 pub mod scripts;
 pub mod tx;

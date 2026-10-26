@@ -21,6 +21,7 @@
           cmake
           pkg-config
           openssl
+          gnupg
           zlib
           config.treefmt.build.wrapper
           # Elm

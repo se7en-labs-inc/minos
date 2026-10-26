@@ -116,6 +116,28 @@ impl Koios {
         Ok(resp)
     }
 
+    /// Fetch the ledger CBOR of a confirmed transaction.
+    pub async fn transaction_cbor(&self, hash: &str) -> Result<String> {
+        let rows: Vec<serde_json::Value> = self
+            .post_request("/tx_cbor")
+            .json(&serde_json::json!({"_tx_hashes":[hash]}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("transaction CBOR response")?;
+        anyhow::ensure!(rows.len() == 1, "expected one confirmed transaction");
+        anyhow::ensure!(
+            rows[0]["tx_hash"].as_str() == Some(hash),
+            "transaction hash response mismatch"
+        );
+        Ok(rows[0]["cbor"]
+            .as_str()
+            .context("missing transaction CBOR")?
+            .to_owned())
+    }
+
     /// Submit a signed transaction. Returns the tx hash.
     pub async fn submit_tx(&self, tx_cbor_hex: &str) -> Result<String> {
         let resp = self
@@ -294,7 +316,7 @@ impl Utxo {
     }
 
     pub fn has_native_assets(&self) -> bool {
-        self.asset_list.as_ref().map_or(false, |a| !a.is_empty())
+        self.asset_list.as_ref().is_some_and(|a| !a.is_empty())
     }
 
     /// Extract the inline datum CBOR hex (from Koios `inline_datum.bytes` field).
@@ -319,7 +341,7 @@ impl Utxo {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, serde::Serialize, Clone)]
 pub struct AssetListItem {
     pub policy_id: String,
     pub asset_name: String,

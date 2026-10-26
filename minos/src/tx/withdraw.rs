@@ -70,7 +70,12 @@ pub fn build(params: WithdrawParams) -> Result<UnsignedTx> {
     // -----------------------------------------------------------------------
     // 1. Encode CIP-100 metadata and compute hash
     // -----------------------------------------------------------------------
-    let (aux_data_cbor, aux_data_hash) = super::metadata::encode_withdraw(&params.instance_id)?;
+    let author = params
+        .vendor_key_hashes
+        .first()
+        .context("withdrawal needs a vendor author key")?;
+    let (aux_data_cbor, aux_data_hash) =
+        super::metadata::encode_withdraw(&params.instance_id, &hex::encode(author))?;
 
     // -----------------------------------------------------------------------
     // 2. Parse addresses

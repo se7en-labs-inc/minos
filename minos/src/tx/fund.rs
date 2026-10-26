@@ -2,8 +2,13 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use pallas_addresses::Address as PallasAddress;
+use pallas_codec::{
+    minicbor,
+    utils::{Int, MaybeIndefArray},
+};
 use pallas_crypto::hash::Hash;
-use pallas_txbuilder::{BuildConway, Input, Output, StagingTransaction};
+use pallas_primitives::conway::{BigInt, BoundedBytes, Constr, PlutusData};
+use pallas_txbuilder::{BuildConway, ExUnits, Input, Output, ScriptKind, StagingTransaction};
 
 use super::cbor_util;
 use super::metadata::{self, FundMilestone};
@@ -15,6 +20,8 @@ pub struct MilestoneSpec {
     pub id: String,
     pub label: String,
     pub description: Option<String>,
+    pub acceptance_criteria: Option<String>,
+    pub requires_evidence: bool,
     pub maturation_ms: u64,
     pub lovelace: u64,
     pub token_amount: u64,
@@ -28,9 +35,12 @@ pub struct FundInput {
 }
 
 pub struct FundParams {
+    pub treasury: Option<TreasurySpend>,
     pub instance_id: String,
     pub vendor_script_hash: Vec<u8>, // 28 bytes
     pub admin_key_hash: Vec<u8>,     // 28 bytes (txAuthor + disclosed signer)
+    pub vendor_key_hash: Option<Vec<u8>>,
+    pub co_signer_hashes: Vec<Vec<u8>>,
     pub project_id: String,
     pub label: String,
     pub description: String,
@@ -51,6 +61,145 @@ pub struct FundParams {
     pub valid_from_slot: u64,
     pub invalid_from_slot: u64,
     pub network_id: u8,
+}
+
+pub struct TreasurySpend {
+    pub input: crate::references::OutRef,
+    pub references: Vec<crate::references::OutRef>,
+    pub collateral: crate::coin_select::WalletUtxo,
+    pub cost_model: Vec<i64>,
+    pub return_address: String,
+    pub return_lovelace: u64,
+    pub return_assets: Vec<(Vec<u8>, Vec<u8>, u64)>,
+}
+
+pub fn select_ada_treasury_input(
+    utxos: &[crate::koios::Utxo],
+    needed: u64,
+) -> Result<&crate::koios::Utxo> {
+    utxos
+        .iter()
+        .filter(|u| {
+            !u.has_native_assets() && u.reference_script.is_none() && u.lovelace() >= needed
+        })
+        .min_by_key(|u| u.lovelace())
+        .context("no ADA-only treasury UTxO can fund all payouts; use deposit-project first")
+}
+
+pub fn select_funding_collateral<'a>(
+    utxos: &'a [crate::coin_select::WalletUtxo],
+    inputs: &[FundInput],
+) -> Result<&'a crate::coin_select::WalletUtxo> {
+    let excluded: Vec<_> = inputs
+        .iter()
+        .map(|i| (i.tx_hash.clone(), i.output_index))
+        .collect();
+    crate::coin_select::select_separate_collateral(utxos, &excluded)
+}
+
+/// Deposit is an ordinary wallet transfer; it does not create a project.
+pub fn build_deposit(params: FundParams, treasury_hash: &[u8]) -> Result<UnsignedTx> {
+    let hash = Hash::<28>::from(<[u8; 28]>::try_from(treasury_hash)?);
+    let destination =
+        PallasAddress::from_bytes(&base_script_addr(&hash, params.network_id).to_vec())?;
+    let mut deposit = Output::new(destination, params.vendor_lovelace_total)
+        .set_inline_datum(vec![0xd8, 0x79, 0x80]);
+    if let (Some(policy), Some(name)) = (&params.token_policy, &params.token_name) {
+        deposit = deposit.add_asset(
+            Hash::from(<[u8; 28]>::try_from(policy.as_slice())?),
+            name.clone(),
+            params.milestones.iter().map(|m| m.token_amount).sum(),
+        )?;
+    }
+    let mut change = Output::new(
+        PallasAddress::from_bech32(&params.fee_addr)?,
+        params.change_lovelace,
+    );
+    if params.change_tokens > 0 {
+        change = change.add_asset(
+            Hash::from(<[u8; 28]>::try_from(
+                params
+                    .token_policy
+                    .as_ref()
+                    .context("missing policy")?
+                    .as_slice(),
+            )?),
+            params.token_name.clone().context("missing token name")?,
+            params.change_tokens,
+        )?;
+    }
+    for (policy, name, qty) in params.extra_change_assets {
+        change = change.add_asset(
+            Hash::from(<[u8; 28]>::try_from(policy.as_slice())?),
+            name,
+            qty,
+        )?;
+    }
+    let mut staging = StagingTransaction::new()
+        .output(deposit)
+        .output(change)
+        .fee(params.fee)
+        .valid_from_slot(params.valid_from_slot)
+        .invalid_from_slot(params.invalid_from_slot)
+        .network_id(params.network_id)
+        .disclosed_signer(Hash::from(<[u8; 28]>::try_from(
+            params.admin_key_hash.as_slice(),
+        )?));
+    if let Some(treasury) = &params.treasury {
+        anyhow::ensure!(
+            treasury.return_lovelace == 0 && treasury.return_assets.is_empty(),
+            "reuse requires an exact deposit value"
+        );
+        let input = Input::new(
+            Hash::from(<[u8; 32]>::try_from(
+                hex::decode(&treasury.input.0)?.as_slice(),
+            )?),
+            treasury.input.1,
+        );
+        staging = staging
+            .collateral_input(Input::new(
+                Hash::from(<[u8; 32]>::try_from(
+                    hex::decode(&treasury.collateral.tx_hash)?.as_slice(),
+                )?),
+                treasury.collateral.output_index,
+            ))
+            .add_spend_redeemer(
+                input,
+                vec![0xd8, 0x79, 0x80],
+                Some(ExUnits {
+                    mem: 5_000_000,
+                    steps: 2_000_000_000,
+                }),
+            )
+            .add_language(ScriptKind::PlutusV3, treasury.cost_model.clone());
+        for (hash, index) in &treasury.references {
+            staging = staging.reference_input(Input::new(
+                Hash::from(<[u8; 32]>::try_from(hex::decode(hash)?.as_slice())?),
+                *index,
+            ));
+        }
+    }
+    for input in params.inputs {
+        staging = staging.input(Input::new(
+            Hash::from(<[u8; 32]>::try_from(
+                hex::decode(input.tx_hash)?.as_slice(),
+            )?),
+            input.output_index,
+        ));
+    }
+    let built = staging
+        .build_conway_raw()
+        .map_err(|e| anyhow::anyhow!("build deposit: {e}"))?;
+    let (aux, hash) = metadata::encode_initialize(
+        &params.instance_id,
+        &hex::encode(&params.admin_key_hash),
+        &format!("{}-funding", params.project_id),
+    )?;
+    let bytes = cbor_util::add_aux_data(&built.tx_bytes.0, &aux, &hash)?;
+    Ok(UnsignedTx::new(
+        "deposit project funds into budget treasury",
+        hex::encode(bytes),
+    ))
 }
 
 pub fn build(params: FundParams) -> Result<UnsignedTx> {
@@ -76,7 +225,10 @@ pub fn build(params: FundParams) -> Result<UnsignedTx> {
     // 2. Build VendorDatum
     // -----------------------------------------------------------------------
     let vendor_multisig = MultisigScript::Signature {
-        key_hash: params.admin_key_hash.clone(),
+        key_hash: params
+            .vendor_key_hash
+            .clone()
+            .unwrap_or_else(|| params.admin_key_hash.clone()),
     };
 
     let payouts: Vec<Payout> = params
@@ -179,6 +331,100 @@ pub fn build(params: FundParams) -> Result<UnsignedTx> {
         .network_id(params.network_id)
         .disclosed_signer(admin_hash);
 
+    for key in params
+        .co_signer_hashes
+        .iter()
+        .chain(params.vendor_key_hash.iter())
+    {
+        staging = staging.disclosed_signer(Hash::from(<[u8; 28]>::try_from(key.as_slice())?));
+    }
+
+    if let Some(treasury) = &params.treasury {
+        let mut value: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, i64>> = BTreeMap::new();
+        let ada: u64 = params.milestones.iter().map(|m| m.lovelace).sum();
+        if ada > 0 {
+            value.insert(vec![], BTreeMap::from([(vec![], i64::try_from(ada)?)]));
+        }
+        if total_tokens > 0 {
+            value.insert(
+                params.token_policy.clone().context("missing policy")?,
+                BTreeMap::from([(
+                    params.token_name.clone().context("missing token name")?,
+                    i64::try_from(total_tokens)?,
+                )]),
+            );
+        }
+        let data = PlutusData::Map(pallas_codec::utils::KeyValuePairs::Def(
+            value
+                .into_iter()
+                .map(|(policy, assets)| {
+                    (
+                        PlutusData::BoundedBytes(BoundedBytes::from(policy)),
+                        PlutusData::Map(pallas_codec::utils::KeyValuePairs::Def(
+                            assets
+                                .into_iter()
+                                .map(|(name, qty)| {
+                                    (
+                                        PlutusData::BoundedBytes(BoundedBytes::from(name)),
+                                        PlutusData::BigInt(BigInt::Int(Int::from(qty))),
+                                    )
+                                })
+                                .collect(),
+                        )),
+                    )
+                })
+                .collect(),
+        ));
+        let redeemer = minicbor::to_vec(PlutusData::Constr(Constr {
+            tag: 123,
+            any_constructor: None,
+            fields: MaybeIndefArray::Indef(vec![data]),
+        }))?;
+        let input = Input::new(
+            Hash::from(<[u8; 32]>::try_from(
+                hex::decode(&treasury.input.0)?.as_slice(),
+            )?),
+            treasury.input.1,
+        );
+        staging = staging
+            .collateral_input(Input::new(
+                Hash::from(<[u8; 32]>::try_from(
+                    hex::decode(&treasury.collateral.tx_hash)?.as_slice(),
+                )?),
+                treasury.collateral.output_index,
+            ))
+            .add_spend_redeemer(
+                input,
+                redeemer,
+                Some(ExUnits {
+                    mem: 5_000_000,
+                    steps: 2_000_000_000,
+                }),
+            )
+            .add_language(ScriptKind::PlutusV3, treasury.cost_model.clone());
+        for (hash, index) in &treasury.references {
+            staging = staging.reference_input(Input::new(
+                Hash::from(<[u8; 32]>::try_from(hex::decode(hash)?.as_slice())?),
+                *index,
+            ));
+        }
+        if treasury.return_lovelace > 0 || !treasury.return_assets.is_empty() {
+            let mut output = Output::new(
+                PallasAddress::from_bech32(&treasury.return_address)?,
+                treasury.return_lovelace,
+            )
+            .set_inline_datum(vec![0xd8, 0x79, 0x80]);
+            for (policy, name, qty) in &treasury.return_assets {
+                output = output.add_asset(
+                    Hash::from(<[u8; 28]>::try_from(policy.as_slice())?),
+                    name.clone(),
+                    *qty,
+                )?;
+            }
+            staging = staging.output(output);
+        }
+    }
+
     for fi in &params.inputs {
         let h: [u8; 32] = hex::decode(&fi.tx_hash)
             .context("fund input hash")?
@@ -202,6 +448,8 @@ pub fn build(params: FundParams) -> Result<UnsignedTx> {
             id: m.id.clone(),
             label: m.label.clone(),
             description: m.description.clone(),
+            acceptance_criteria: m.acceptance_criteria.clone(),
+            requires_evidence: m.requires_evidence,
         })
         .collect();
 

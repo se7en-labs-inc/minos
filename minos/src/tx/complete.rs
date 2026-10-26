@@ -9,6 +9,29 @@ use pallas_txbuilder::{BuildConway, ExUnits, Input, Output, ScriptKind, StagingT
 
 use super::UnsignedTx;
 
+/// Keep every payout in place by putting the lower bound before the first
+/// active maturation. The vendor validator classifies payouts using this bound,
+/// rather than the wall clock or the upper bound. This permits evidence-only
+/// submissions without claiming funds, as the portal UI does.
+pub fn validity_start(
+    tip_slot: u64,
+    genesis_offset_secs: u64,
+    datum: &crate::types::VendorDatum,
+) -> u64 {
+    let recent = tip_slot.saturating_sub(120);
+    datum
+        .payouts
+        .iter()
+        .filter(|p| matches!(p.status, crate::types::PayoutStatus::Active))
+        .map(|p| {
+            (p.maturation / 1000)
+                .saturating_sub(genesis_offset_secs)
+                .saturating_sub(1)
+        })
+        .min()
+        .map_or(recent, |slot| slot.min(recent))
+}
+
 #[derive(Clone)]
 pub struct CompleteParams {
     // Portal data — vendor UTxO
@@ -24,11 +47,16 @@ pub struct CompleteParams {
     pub registry_utxo_index: u64,
     pub vendor_script_ref_hash: String,
     pub vendor_script_ref_index: u64,
-    pub treasury_script_ref_hash: String,
-    pub treasury_script_ref_index: u64,
 
     // Required signers (vendor multisig key hashes)
     pub vendor_key_hashes: Vec<Vec<u8>>,
+    /// Portal fee wallet signer, supplied later by the portal.
+    pub fee_key_hash: Option<Vec<u8>>,
+    pub staking_script_hashes: Vec<[u8; 28]>,
+    pub staking_script_refs: Vec<(String, u64)>,
+    /// Execution budget per staking script.
+    pub staking_reward_mem: u64,
+    pub staking_reward_steps: u64,
 
     // Coin selection
     pub fee_inputs: Vec<crate::coin_select::WalletUtxo>,
@@ -50,6 +78,7 @@ pub struct CompleteParams {
     pub milestone_id: String,
     pub description: String,
     pub evidence_urls: Vec<String>,
+    pub evidence_labels: Vec<String>,
 
     // Network (0 = testnet/preview, 1 = mainnet)
     pub network_id: u8,
@@ -59,12 +88,22 @@ pub fn build(params: CompleteParams) -> Result<UnsignedTx> {
     // -----------------------------------------------------------------------
     // 1. Encode CIP-100 metadata and compute hash
     // -----------------------------------------------------------------------
+    let author = params
+        .vendor_key_hashes
+        .first()
+        .context("completion needs a vendor author key")?;
+    anyhow::ensure!(
+        author.len() == 28,
+        "completion author must be a 28-byte key hash"
+    );
     let (aux_data_cbor, aux_data_hash) = super::metadata::encode_complete(
         &params.instance_id,
+        &hex::encode(author),
         &params.project_id,
         &params.milestone_id,
         &params.description,
         &params.evidence_urls,
+        &params.evidence_labels,
     )?;
 
     // -----------------------------------------------------------------------
@@ -109,15 +148,6 @@ pub fn build(params: CompleteParams) -> Result<UnsignedTx> {
     let vendor_ref_input = Input::new(
         Hash::from(vendor_ref_hash_bytes),
         params.vendor_script_ref_index,
-    );
-
-    let treasury_ref_hash_bytes: [u8; 32] = hex::decode(&params.treasury_script_ref_hash)
-        .context("treasury script ref hash")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("treasury script ref hash must be 32 bytes"))?;
-    let treasury_ref_input = Input::new(
-        Hash::from(treasury_ref_hash_bytes),
-        params.treasury_script_ref_index,
     );
 
     // -----------------------------------------------------------------------
@@ -171,7 +201,6 @@ pub fn build(params: CompleteParams) -> Result<UnsignedTx> {
         // Reference inputs
         .reference_input(registry_ref_input)
         .reference_input(vendor_ref_input)
-        .reference_input(treasury_ref_input)
         // Vendor output (full value back to script)
         .output(vendor_output)
         // Change output
@@ -195,7 +224,14 @@ pub fn build(params: CompleteParams) -> Result<UnsignedTx> {
             }),
         )
         // Language view for script_data_hash
-        .add_language(ScriptKind::PlutusV3, params.v3_cost_model);
+        .add_language(ScriptKind::PlutusV3, params.v3_cost_model.clone());
+
+    for (hash, index) in &params.staking_script_refs {
+        let hash: [u8; 32] = hex::decode(hash)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("staking script reference hash must be 32 bytes"))?;
+        staging = staging.reference_input(Input::new(Hash::from(hash), *index));
+    }
 
     // Fee inputs
     for fi in &params.fee_inputs {
@@ -207,7 +243,11 @@ pub fn build(params: CompleteParams) -> Result<UnsignedTx> {
     }
 
     // Required signers
-    for kh in &params.vendor_key_hashes {
+    for kh in params
+        .vendor_key_hashes
+        .iter()
+        .chain(params.fee_key_hash.iter())
+    {
         let kh_arr: [u8; 28] = kh
             .as_slice()
             .try_into()
@@ -224,8 +264,20 @@ pub fn build(params: CompleteParams) -> Result<UnsignedTx> {
 
     let tx_cbor = &built.tx_bytes.0;
 
-    let final_cbor = super::cbor_util::add_aux_data(tx_cbor, &aux_data_cbor, &aux_data_hash)
+    let mut final_cbor = super::cbor_util::add_aux_data(tx_cbor, &aux_data_cbor, &aux_data_hash)
         .context("add_aux_data")?;
+
+    for hash in &params.staking_script_hashes {
+        final_cbor = super::cbor_util::add_treasury_withdrawal(
+            &final_cbor,
+            hash,
+            params.network_id,
+            params.staking_reward_mem,
+            params.staking_reward_steps,
+            &params.v3_cost_model,
+        )
+        .context("add vendor script authorization")?;
+    }
 
     Ok(UnsignedTx::new(
         format!("complete milestone {}", params.milestone_id),

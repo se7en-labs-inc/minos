@@ -259,7 +259,7 @@ fn withdrawal_builder_includes_only_required_references() {
         registry_utxo_index: 0,
         vendor_script_ref_hash: get("c307").tx_hash.clone(),
         vendor_script_ref_index: 0,
-        vendor_key_hashes: vec![],
+        vendor_key_hashes: vec![vec![7; 28]],
         fee_inputs: vec![fee.into()],
         collateral: get("ff9d").into(),
         fee_addr: fee.address.clone(),
@@ -297,6 +297,19 @@ fn withdrawal_builder_includes_only_required_references() {
         .map(|prefix| (get(prefix).tx_hash.clone(), 0))
         .collect();
     assert_eq!(actual, expected);
+    let metadata = serde_json::to_value(&tx.auxiliary_data).unwrap();
+    let fields = metadata["Shelley"]["1694"]["Map"].as_array().unwrap();
+    let author = fields.iter().find(|p| p[0]["Text"] == "txAuthor").unwrap();
+    assert_eq!(author[1]["Text"], "07".repeat(28));
+    assert!(tx
+        .transaction_body
+        .required_signers
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|s| s.as_ref() == [7; 28]));
+    assert!(minos::tx::metadata::encode_withdraw("instance", "").is_err());
+    assert!(minos::tx::metadata::encode_withdraw("instance", &"07".repeat(27)).is_err());
 }
 
 fn synthetic(script_source: &str, mem: u64) -> (Vec<u8>, Vec<Utxo>) {
