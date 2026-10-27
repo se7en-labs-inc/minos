@@ -1721,6 +1721,7 @@ Applies to:
 Applies to:
 - clap 4.6.7 — source: https://crates.io/api/v1/crates/clap/4.6.7/download
 - clap_builder 4.6.7 — source: https://crates.io/api/v1/crates/clap_builder/4.6.7/download
+- clap_complete 4.6.11 — source: https://crates.io/api/v1/crates/clap_complete/4.6.11/download
 - clap_derive 4.6.7 — source: https://crates.io/api/v1/crates/clap_derive/4.6.7/download
 - clap_lex 1.1.1 — source: https://crates.io/api/v1/crates/clap_lex/1.1.1/download
 

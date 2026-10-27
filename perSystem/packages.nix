@@ -62,7 +62,7 @@
       ];
 
       buildInputs = with pkgs; [openssl zlib];
-      nativeCheckInputs = with pkgs; [gnupg openssl];
+      nativeCheckInputs = with pkgs; [gnupg openssl bashInteractive];
 
       meta = {
         mainProgram = crateInfo.pname;
@@ -158,8 +158,13 @@
           # executables need it without the development shell's LD_LIBRARY_PATH.
           buildInputs = commonArgs.buildInputs ++ [pkgs.stdenv.cc.cc.lib];
           env.NIX_LDFLAGS = "-rpath ${lib.makeLibraryPath [pkgs.stdenv.cc.cc.lib]}";
-          nativeBuildInputs = commonArgs.nativeBuildInputs ++ [pkgs.makeWrapper];
+          nativeBuildInputs = commonArgs.nativeBuildInputs ++ [pkgs.makeWrapper pkgs.installShellFiles];
           postInstall = ''
+            for shell in bash zsh fish; do
+              "$out/bin/minos" completions "$shell" > "minos.$shell"
+            done
+            installShellCompletion --cmd minos \
+              --bash minos.bash --zsh minos.zsh --fish minos.fish
             install -Dm644 "$src/LICENSE" "$out/share/doc/minos/LICENSE"
             install -Dm644 "$src/NOTICE" "$out/share/doc/minos/NOTICE"
             install -Dm644 "$src/THIRD_PARTY_NOTICES.md" "$out/share/doc/minos/THIRD_PARTY_NOTICES.md"

@@ -215,3 +215,26 @@ historical private-path/operational notes. Current-tree cleanup and secret scans
 do not rewrite Git history. No push, tag, visibility change or publication is
 part of the current feature implementation. Live preview signing/submission needs
 separate authorization and must use disposable testnet credentials.
+
+## Shell completion
+
+The Nix package installs Bash, Zsh and Fish completions in their standard locations.
+Your shell's completion support must be enabled. To activate Bash completion in
+an existing session:
+
+```bash
+source <(minos completions bash)
+```
+
+Add that line to `~/.bashrc` if your shell does not load packaged completions.
+For manual Zsh setup, write `minos completions zsh` to `_minos` in a directory on
+`$fpath`, then run `autoload -Uz compinit && compinit`. For Fish:
+
+```fish
+minos completions fish > ~/.config/fish/completions/minos.fish
+```
+
+Generation is offline and uses the same command definition as the CLI. Nested
+commands, options, network values and airgap file paths are completed without
+accessing wallets or contacting the portal/node. Elvish and PowerShell script
+output is also available through `minos completions <shell>`.

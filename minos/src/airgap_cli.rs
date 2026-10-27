@@ -10,27 +10,27 @@ use std::path::PathBuf;
 #[derive(Subcommand)]
 pub enum AirgapCmd {
     Review {
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::FilePath)]
         package: PathBuf,
     },
     Sign {
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::FilePath)]
         package: PathBuf,
         /// Mnemonic wallet; .asc/.gpg is decrypted by GPG on this offline machine.
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::FilePath)]
         wallet: PathBuf,
         #[arg(long, default_value_t = 0)]
         account: u32,
         /// Optionally pin the package hash, for scripted signing workflows.
         #[arg(long)]
         expected_request_hash: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::FilePath)]
         out: PathBuf,
     },
     Verify {
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::FilePath)]
         package: PathBuf,
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::FilePath)]
         signed: PathBuf,
     },
 }

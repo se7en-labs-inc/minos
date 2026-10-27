@@ -29,6 +29,7 @@ cryptoxide = "0.4"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4.6.11"
 
 # Async runtime + HTTP
 tokio = { version = "1", features = ["full"] }

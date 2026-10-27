@@ -17,6 +17,7 @@
     devShells.default = with pkgs;
       mkShell {
         packages = [
+          bashInteractive
           toolchain
           cmake
           pkg-config

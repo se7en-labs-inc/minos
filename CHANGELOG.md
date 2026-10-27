@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Generate shell completions with `minos completions <shell>` and install Bash,
+  Zsh and Fish completions with the Nix package.
+
 - Make the expected request hash optional for airgap signing while retaining
   explicit hash-pin validation and the signed response's package binding.
 

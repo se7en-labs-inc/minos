@@ -1,7 +1,7 @@
 # Dependency notices and review
 
 The source is Apache-2.0. Third-party components retain their own licenses.
-The locked Linux Rust graph was inspected with cargo-about 0.9.0: 383 crates and
+The locked Linux Rust graph was inspected with cargo-about 0.9.0: 384 crates and
 111 associated license texts. Full texts, copyright notices and versioned source
 links are in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md), including the
 unmodified MPL-2.0 `ascii_utils` 0.9.3 and `fast_chemail` 0.9.6 sources. The inventory

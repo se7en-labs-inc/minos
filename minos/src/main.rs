@@ -32,7 +32,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use config::Network;
 use koios::Koios;
 use node::DataSource;
@@ -162,6 +162,11 @@ enum WalletCmd {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Generate a shell completion script without contacting any services.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Save the portal's public HTML and client bundle for protocol inspection
     PortalClient {
         #[arg(long)]
@@ -700,6 +705,10 @@ enum MafCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Commands::Completions { shell } = &cli.command {
+        clap_complete::generate(*shell, &mut Cli::command(), "minos", &mut std::io::stdout());
+        return Ok(());
+    }
     let vendor_signers = cli
         .vendor_signer
         .iter()
@@ -913,6 +922,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Airgap { cmd } => airgap_cli::run(cmd),
+        Commands::Completions { .. } => unreachable!("dispatched before client construction"),
         Commands::Evidence {
             cmd: EvidenceCmd::PreparePackage { tx, file, out },
         } => {
