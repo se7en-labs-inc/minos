@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Make the expected request hash optional for airgap signing while retaining
+  explicit hash-pin validation and the signed response's package binding.
+
+- Make offline airgap review/sign/verify independent of local clock drift while
+  preserving online expiry and authorization-time checks.
+
+- Restore Sundae portal defaults and detect its legacy read schema while retaining
+  strict validation for the bundled API-v2 debugging portal.
+- Verify UnixFS PDF CIDs offline so one airgap run signs both the transaction and
+  CIP-30 upload authorization without a returned-CID mismatch.
+- Preserve existing witnesses when measuring fees during signed preflight.
+
 - Require explicit mnemonic display and create private wallet files without
   overwriting existing paths.
 - Preserve transaction body and witness bytes when signing; reject unsupported

@@ -167,23 +167,33 @@ pub fn maximum_fee(params: &ProtocolParams, reference_bytes: u64, plutus: bool) 
         .context("fee reserve overflow")
 }
 
-/// Calculate size by inserting synthetic witnesses into an in-memory copy only.
-/// This measures map/set headers at CBOR width boundaries without loading keys.
+/// Preserve existing witnesses and insert only missing synthetic witnesses into
+/// an in-memory copy. Supports unsigned balancing and witnessed preflight without
+/// changing the transaction body or loading keys.
 pub fn signed_size(bytes: &[u8], witnesses: u64) -> Result<u64> {
     let tx: Tx<'_> = minicbor::decode(bytes)?;
+    let mut keys = tx
+        .transaction_witness_set
+        .vkeywitness
+        .iter()
+        .flat_map(|items| items.iter())
+        .map(|witness| {
+            <[u8; 32]>::try_from(witness.vkey.as_slice()).context("invalid witness public key")
+        })
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
     ensure!(
-        tx.transaction_witness_set
-            .vkeywitness
-            .as_ref()
-            .is_none_or(|w| w.is_empty()),
-        "fee balancing requires an unsigned transaction"
+        witnesses <= 1024 && keys.len() <= 1024,
+        "too many transaction witnesses"
     );
-    ensure!(witnesses <= 1024, "too many transaction witnesses");
     let mut sized = bytes.to_vec();
-    for index in 0..witnesses {
+    let mut index = 0u64;
+    while (keys.len() as u64) < witnesses {
         let mut key = [0; 32];
         key[..8].copy_from_slice(&index.to_be_bytes());
-        sized = super::sign::add_vkey_witness(&sized, &key, &[0; 64])?;
+        index += 1;
+        if keys.insert(key) {
+            sized = super::sign::add_vkey_witness(&sized, &key, &[0; 64])?;
+        }
     }
     Ok(sized.len() as u64)
 }
@@ -496,14 +506,26 @@ mod tests {
 
     #[test]
     fn witness_header_boundaries_and_size_limits_are_measured() {
+        let mut p = parameters();
         let tx = transaction(0, 5_000_000, 0);
         let bytes = hex::decode(&tx.cbor_hex).unwrap();
         assert_eq!(signed_size(&bytes, 0).unwrap(), bytes.len() as u64);
+        let one = super::super::sign::add_vkey_witness(&bytes, &[7; 32], &[0; 64]).unwrap();
+        let two = super::super::sign::add_vkey_witness(&one, &[8; 32], &[0; 64]).unwrap();
+        assert_eq!(signed_size(&one, 1).unwrap(), one.len() as u64);
+        assert_eq!(
+            signed_size(&one, 2).unwrap(),
+            signed_size(&bytes, 2).unwrap()
+        );
+        assert_eq!(signed_size(&two, 1).unwrap(), two.len() as u64);
+        assert_eq!(
+            minimum_fee(&hex::encode(&one), &p, 0, 2).unwrap(),
+            minimum_fee(&tx.cbor_hex, &p, 0, 2).unwrap()
+        );
         assert_eq!(
             signed_size(&bytes, 24).unwrap() - signed_size(&bytes, 23).unwrap(),
             102
         );
-        let mut p = parameters();
         p.max_tx_size = signed_size(&bytes, 24).unwrap();
         assert!(minimum_fee(&tx.cbor_hex, &p, 0, 24).is_ok());
         p.max_tx_size -= 1;

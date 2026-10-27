@@ -322,7 +322,7 @@ enum Commands {
         #[arg(long = "evidence-label", requires = "evidence_urls")]
         evidence_labels: Vec<String>,
 
-        /// Local evidence file; calculate its CIDv1 raw/SHA-256 URL without uploading
+        /// Local evidence file; calculate its portal-compatible UnixFS URL without uploading
         #[arg(long = "evidence-file")]
         evidence_files: Vec<PathBuf>,
 
@@ -642,6 +642,9 @@ enum EvidenceCmd {
     Cid {
         #[arg(long)]
         file: PathBuf,
+        /// Match the portal's UnixFS CIDv1 import (256-KiB chunks, raw leaves).
+        #[arg(long)]
+        unixfs: bool,
     },
 }
 
@@ -1010,9 +1013,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Evidence {
-            cmd: EvidenceCmd::Cid { file },
+            cmd: EvidenceCmd::Cid { file, unixfs },
         } => {
-            println!("{}", minos::evidence::file_url(&file)?);
+            if unixfs {
+                println!("{}", minos::evidence::unixfs_file_url(&file)?);
+            } else {
+                println!("{}", minos::evidence::file_url(&file)?);
+            }
             Ok(())
         }
         Commands::Instances => cmd_instances(&portal).await,
@@ -1041,7 +1048,7 @@ async fn main() -> Result<()> {
                 evidence_labels
             };
             for path in evidence_files {
-                let url = minos::evidence::file_url(&path)?;
+                let url = minos::evidence::unixfs_file_url(&path)?;
                 eprintln!("{}: {url} (CIDv1 raw; file not uploaded)", path.display());
                 evidence_urls.push(url);
                 evidence_labels.push(

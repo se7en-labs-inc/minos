@@ -1,5 +1,9 @@
 # Portal operation and recovery
 
+The bundled portal is for debugging. Normal CLI operations use Sundae's public
+portal for the selected network. To use this local portal, pass its GraphQL URL
+explicitly with `--portal`; the CLI supports both advertised read schemas.
+
 Use the pinned Nix environment (`nix develop`). The portal embeds DuckDB; it needs
 no database service. Its JSON extension is compiled in. The package supplies the
 C++ runtime; the development shell is not a runtime dependency.

@@ -60,7 +60,11 @@ mnemonic always requires an explicit flag.
 
 Schema version 3 uses Sled as the authoritative block journal/projection store.
 DuckDB is the embedded query cache; it needs no external database service and its
-JSON support is bundled. GraphQL/CLI/UI API version 2 distinguishes pending,
+JSON support is bundled. The normal CLI defaults are Sundae's public mainnet and
+preview portals; their legacy read schema is detected through introspection.
+Legacy confirmation is unknown, and builders still check live chain inputs and
+references. The bundled portal/UI are optional debugging tools selected through
+an explicit endpoint. Their GraphQL API version 2 distinguishes pending,
 confirmed, unresolved and unavailable data. Older API/schema versions require the
 explicit migration/reindex procedure in [operations](operations.md).
 

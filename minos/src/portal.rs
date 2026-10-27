@@ -4,6 +4,35 @@ use serde_json::{json, Value};
 pub struct Portal {
     client: reqwest::Client,
     url: String,
+    read_schema: tokio::sync::OnceCell<ReadSchema>,
+}
+
+#[derive(Clone, Copy)]
+enum ReadSchema {
+    Legacy,
+    V2,
+}
+
+impl ReadSchema {
+    fn query(self, query: &str) -> String {
+        match self {
+            Self::V2 => query.to_owned(),
+            Self::Legacy => query
+                .replace("apiVersion", "")
+                .replace("description confirmed", "description")
+                .replace("registryReference { transaction index }", ""),
+        }
+    }
+
+    fn validate(self, data: &Value) -> Result<()> {
+        if matches!(self, Self::V2) {
+            anyhow::ensure!(
+                data["apiVersion"] == 2,
+                "unsupported portal API version; version 2 is required"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Portal {
@@ -13,7 +42,35 @@ impl Portal {
                 .build()
                 .expect("HTTP client configuration"),
             url: url.to_string(),
+            read_schema: tokio::sync::OnceCell::new(),
         }
+    }
+
+    async fn read_schema(&self) -> Result<ReadSchema> {
+        self.read_schema
+            .get_or_try_init(|| async {
+                let data = self
+                    .query(
+                        "query { __type(name: \"Query\") { fields { name } } }",
+                        None,
+                    )
+                    .await?;
+                let fields = data["__type"]["fields"]
+                    .as_array()
+                    .context("portal does not advertise its query schema")?;
+                let has = |name| fields.iter().any(|field| field["name"] == name);
+                anyhow::ensure!(
+                    has("instances") && has("instanceById"),
+                    "unsupported portal query schema"
+                );
+                Ok(if has("apiVersion") {
+                    ReadSchema::V2
+                } else {
+                    ReadSchema::Legacy
+                })
+            })
+            .await
+            .copied()
     }
 
     pub async fn query(&self, query: &str, variables: Option<Value>) -> Result<Value> {
@@ -58,15 +115,15 @@ impl Portal {
                 }
             }
         "#;
-        let data = self.query(q, None).await?;
-        anyhow::ensure!(
-            data["apiVersion"] == 2,
-            "unsupported portal API version; version 2 is required"
-        );
+        let schema = self.read_schema().await?;
+        let data = self.query(&schema.query(q), None).await?;
+        schema.validate(&data)?;
         let arr = data["instances"]
             .as_array()
             .context("instances: expected array")?;
-        arr.iter().map(parse_instance).collect()
+        arr.iter()
+            .map(|value| parse_instance(value, schema))
+            .collect()
     }
 
     pub async fn instance_by_id(&self, id: &str) -> Result<Instance> {
@@ -101,14 +158,12 @@ impl Portal {
             }
         "#;
         let vars = json!({ "id": id });
-        let data = self.query(q, Some(vars)).await?;
+        let schema = self.read_schema().await?;
+        let data = self.query(&schema.query(q), Some(vars)).await?;
+        schema.validate(&data)?;
+        let instance = parse_instance(&data["instanceById"], schema)?;
         anyhow::ensure!(
-            data["apiVersion"] == 2,
-            "unsupported portal API version; version 2 is required"
-        );
-        let instance = parse_instance(&data["instanceById"])?;
-        anyhow::ensure!(
-            instance.confirmed,
+            instance.confirmed != Some(false),
             "instance is registered but its publication is not confirmed"
         );
         Ok(instance)
@@ -364,21 +419,27 @@ pub struct Instance {
     pub vendor_expiration_ms: u64,
     pub registry: RegistryInfo,
     pub projects: Vec<Project>,
-    pub confirmed: bool,
+    /// Legacy public portals do not expose confirmation; chain checks remain required.
+    pub confirmed: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
 // Parsers
 // ---------------------------------------------------------------------------
 
-fn parse_instance(v: &Value) -> Result<Instance> {
+fn parse_instance(v: &Value, schema: ReadSchema) -> Result<Instance> {
     Ok(Instance {
         identifier: str(v, "identifier")?,
         label: str(v, "label")?,
         description: str(v, "description")?,
-        confirmed: v["confirmed"]
-            .as_bool()
-            .context("missing instance confirmation state")?,
+        confirmed: match schema {
+            ReadSchema::Legacy => None,
+            ReadSchema::V2 => Some(
+                v["confirmed"]
+                    .as_bool()
+                    .context("missing instance confirmation state")?,
+            ),
+        },
         expiration_ms: posix_ms(v, "expiration")?,
         payout_upperbound_ms: posix_ms(v, "payoutUpperbound")?,
         vendor_expiration_ms: posix_ms(v, "vendorExpiration")?,

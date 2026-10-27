@@ -59,3 +59,34 @@ selection excludes reserved, spent and asset-bearing rows. A mock portal verifie
 submission uses newTransaction and preserves exact CBOR. The actual unsigned
 transaction contains the selected PDF URL, preserves vendor output, and passes
 local script evaluation before handoff. No upload or submission is performed.
+
+## Authorized full-package compatibility correction (2026-10-27)
+
+The complete offline operation must return both the transaction witness and CIP-30
+COSE upload signature in one signing run. Restore Sundae as the network default
+and detect its advertised read schema; endpoints advertising API-v2 still require
+strict version and confirmation validation, without error-triggered downgrade.
+Missing legacy confirmation fields must remain unknown rather than fabricated.
+Transaction construction must still resolve live inputs/registry/scripts and pass
+current preflight before writing an unsigned payload.
+
+Bind the package's evidence URL to the PDF bytes using either the existing raw CID
+or a deterministic UnixFS CIDv1 import: SHA-256, 256-KiB fixed chunks, raw leaves,
+balanced DAG, no directory wrapping/mode/mtime. Select the representation from the
+signed metadata and independently recompute it offline. Reject any other URL or
+changed bytes. Keep exact CID comparison after upload. Never insert a returned
+CID into an already signed transaction. Preserve existing package format/raw support.
+
+## Offline clock independence (2026-10-27)
+
+Offline review, signing and signature verification must not trust or require the
+machine's wall clock. Validate package/body/metadata/PDF/CID/network/signer and
+well-formed validity/timestamp relationships; display the encoded validity window.
+A day of clock drift in either direction must not prevent review or signing.
+Online preparation, upload and transaction preflight/submission retain current-time
+checks. Signing does not extend a transaction's chain validity or mutate the
+server-issued upload timestamp. Preserve existing payload bytes and request hashes.
+
+The expected-request-hash signing flag is optional. Always display the package
+review before loading the wallet, and retain its hash binding in the returned
+signed response. An explicitly supplied hash must still match before key access.

@@ -81,3 +81,45 @@ using add_treasury_withdrawal; include its execution and reference-script costs
 in the fee. Preserve the vendor output. Run preflight inside cmd_complete before
 writing the unsigned file so a failed transaction is never handed off as ready.
 Add an offline fixture test that exercises both vendor and allowlist validators.
+
+## Full-package compatibility correction
+
+Detect the advertised portal read schema and use schema-specific queries. Endpoints
+advertising v2 must reject missing/unsupported versions and unconfirmed registrations.
+Legacy instances expose unknown confirmation; live construction verifies chain
+references independently. Do not add automatic mutation fallback or submission.
+
+Implement bounded UnixFS CID construction in the existing Rust evidence module,
+using existing SHA-256/base32 support and canonical DAG-PB encoding from the IPFS
+UnixFS and IPLD DAG-PB primary specifications. Check known public vectors and
+independent Kubo output at empty/single/chunk-boundary/multichunk sizes. Package
+prepare/validate derives the expected metadata URL from exact PDF bytes, accepts
+only supported representations, and reports the chosen import profile for review.
+Test both returned signatures plus wrong-CID/content/profile tampering. Regenerate
+current unsigned transaction and combined package under new filenames only after
+live input/protocol checks. No mainnet keys, uploads or submissions in this work.
+
+### Portal role clarification (2026-10-27)
+
+Sundae's public mainnet/preview portals are the normal service; this repository's
+portal is a debugging tool. Restore the public network defaults. Negotiate read
+schema through explicit introspection once per client, with no error-triggered
+fallback: absent apiVersion selects legacy only when required query fields are
+advertised; advertised v2 requires version2 and confirmation fields. Missing
+legacy confirmation remains unknown. Preserve explicit --portal for debugging.
+The preview rehearsal uses the already configured whitelisted wallet and Base
+instance; do not deploy another instance or use newly generated wallets.
+
+Signed preflight must preserve/count existing vkey witnesses and synthesize only
+missing ones for size estimation. The live combined-flow rehearsal exposed the
+unsigned-only helper; cover partially/fully/extra-witness cases without changing
+body bytes. Complete --evidence-file uses the same bounded UnixFS profile by
+default; raw CID remains available explicitly through evidence cid/--evidence-url.
+
+Split structural/cryptographic package validation from online current-time policy.
+Offline CLI commands use only structural/cryptographic methods; online methods
+retain strict expiry/not-yet-valid/future-authorization checks. Display absolute
+encoded times without a misleading age computed from the offline clock. Add
+positive skewed-clock signing/verification regressions and online rejection tests,
+including malformed validity windows and authorization timestamps. Existing real
+payloads and their hashes must not be rewritten to accommodate the clock.

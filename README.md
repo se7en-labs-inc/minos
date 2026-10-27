@@ -50,7 +50,7 @@ minos --help
 | `--node-socket PATH` | Query and submit directly through Pallas; also accepts `CARDANO_NODE_SOCKET_PATH` |
 | `--node-timeout-secs N` | Per connection/query deadline, default 30 seconds |
 | `--koios-key KEY` | Optional Koios API key; also accepts `KOIOS_API_KEY` |
-| `--portal URL` | API v2 GraphQL endpoint; default `http://127.0.0.1:8080/graphql` |
+| `--portal URL` | Defaults to the network's Sundae portal; set explicitly for a local debugging portal |
 | `--script-reference HASH=TX_HASH#INDEX` | Repeat for verified reference-script locations |
 | `--vendor-signer HASH` | Repeat to select vendor threshold signers or a script-only metadata actor; alias `--signer` |
 
@@ -149,8 +149,11 @@ The bundled portal registers witnessed transactions for tracking through
 `registerTransaction` / its `newTransaction` alias. Registration never signs,
 sponsors or submits. `indexTransaction` verifies a fetched transaction and durably
 queues background history replay; its acknowledgement does not mean confirmation.
-Deploy matching API v2 CLI/portal/UI versions. Third-party portal APIs and sponsored
-fee-signing workflows are not implied by compatibility with this portal.
+The CLI normally uses Sundae's public portal for the selected network. It detects
+the advertised read schema; API-v2 endpoints retain strict version/confirmation
+checks. Legacy Sundae confirmation is unknown until checked on chain. The bundled
+API-v2 portal/UI are debugging tools; select them explicitly with `--portal`.
+Sponsored fee signing is a separate operator-controlled workflow.
 
 ## Portal and UI
 

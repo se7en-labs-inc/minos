@@ -21,9 +21,9 @@ pub enum AirgapCmd {
         wallet: PathBuf,
         #[arg(long, default_value_t = 0)]
         account: u32,
-        /// Request hash displayed by review, to explicitly select reviewed bytes.
+        /// Optionally pin the package hash, for scripted signing workflows.
         #[arg(long)]
-        expected_request_hash: String,
+        expected_request_hash: Option<String>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -40,11 +40,10 @@ fn read(path: &std::path::Path) -> Result<Package> {
 }
 
 pub fn run(command: AirgapCmd) -> Result<()> {
-    let now = chrono::Utc::now().timestamp();
     match command {
         AirgapCmd::Review { package } => {
             let package = read(&package)?;
-            package.validate(now)?;
+            package.validate_offline()?;
             println!("{}", serde_json::to_string_pretty(&package.review()?)?);
         }
         AirgapCmd::Sign {
@@ -55,11 +54,13 @@ pub fn run(command: AirgapCmd) -> Result<()> {
             out,
         } => {
             let package = read(&package)?;
-            package.validate(now)?;
-            ensure!(
-                package.request_hash()? == expected_request_hash,
-                "reviewed request hash mismatch"
-            );
+            package.validate_offline()?;
+            if let Some(expected) = expected_request_hash {
+                ensure!(
+                    package.request_hash()? == expected,
+                    "reviewed request hash mismatch"
+                );
+            }
             ensure!(!out.exists(), "output already exists");
             println!("{}", serde_json::to_string_pretty(&package.review()?)?);
             let mnemonic = wallet::load_mnemonic(&path)?;
@@ -67,16 +68,15 @@ pub fn run(command: AirgapCmd) -> Result<()> {
                 hex::encode(wallet::payment_key_hash(&mnemonic, account)?) == package.signer,
                 "wallet/account does not match vendor signer"
             );
-            let signed = package.sign(chrono::Utc::now().timestamp(), |message| {
-                wallet::sign_tx_body(&mnemonic, account, message)
-            })?;
+            let signed = package
+                .sign_offline(|message| wallet::sign_tx_body(&mnemonic, account, message))?;
             airgap::write_new(&out, &signed)?;
             println!("Wrote both vendor signatures to {}", out.display());
         }
         AirgapCmd::Verify { package, signed } => {
             let package = read(&package)?;
             let signed: SignedPackage = serde_json::from_slice(&std::fs::read(signed)?)?;
-            package.verify(&signed, now)?;
+            package.verify_offline(&signed)?;
             println!(
                 "Verified transaction witness and upload authorization: {}",
                 package.body_hash

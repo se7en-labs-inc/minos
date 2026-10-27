@@ -168,7 +168,9 @@ impl Package {
             signer: text(&meta["txAuthor"])?,
             body_hash: hex::encode(sign::tx_body_hash(&raw)?),
             file_sha256: sha256(&bytes),
-            evidence_url: format!("ipfs://{}", evidence::raw_cid(bytes.as_slice())?),
+            evidence_url: text(
+                &meta["body"]["milestones"][&payload.milestone]["evidence"][0]["anchorUrl"],
+            )?,
             file_hex: hex::encode(bytes),
             tx_cbor_hex: tx_hex,
             upload_payload_hex: hex::encode(serde_json::to_vec(&payload)?),
@@ -199,6 +201,15 @@ impl Package {
     }
 
     pub fn validate(&self, now: i64) -> Result<()> {
+        self.validate_with_clock(Some(now))
+    }
+
+    /// Offline integrity checks deliberately do not consult the machine's clock.
+    pub fn validate_offline(&self) -> Result<()> {
+        self.validate_with_clock(None)
+    }
+
+    fn validate_with_clock(&self, now: Option<i64>) -> Result<()> {
         ensure!(
             self.version == 1 && self.network <= 1,
             "unsupported package version/network"
@@ -239,8 +250,6 @@ impl Package {
         } else {
             1_666_656_000
         };
-        let slot = now.checked_sub(offset).context("invalid current time")?;
-        ensure!(slot >= 0, "time precedes network genesis");
         let lower = tx
             .transaction_body
             .validity_interval_start
@@ -249,20 +258,21 @@ impl Package {
             .transaction_body
             .ttl
             .context("transaction expiry missing")?;
-        ensure!(
-            lower < upper && (slot as u64) >= lower && (slot as u64) < upper,
-            "transaction expired or not yet valid"
-        );
+        ensure!(lower < upper, "invalid transaction validity window");
+        if let Some(now) = now {
+            let slot = now.checked_sub(offset).context("invalid current time")?;
+            ensure!(
+                slot >= 0 && (slot as u64) >= lower && (slot as u64) < upper,
+                "transaction expired or not yet valid"
+            );
+        }
         let file = hex::decode(&self.file_hex)?;
         ensure!(
             file.len() <= 10 * 1024 * 1024 && file.starts_with(b"%PDF-"),
             "expected PDF at most 10 MiB"
         );
         ensure!(sha256(&file) == self.file_sha256, "PDF hash mismatch");
-        ensure!(
-            format!("ipfs://{}", evidence::raw_cid(file.as_slice())?) == self.evidence_url,
-            "PDF/CID mismatch"
-        );
+        evidence::verify_url(&file, &self.evidence_url)?;
         let payload = self.payload()?;
         ensure!(
             payload.action == "create_evidence_upload_ticket",
@@ -270,10 +280,22 @@ impl Package {
         );
         ensure!(hex::decode(&payload.nonce)?.len() == 16, "invalid nonce");
         let timestamp = DateTime::parse_from_rfc3339(&payload.timestamp)?.timestamp();
+        let lower_time = i64::try_from(lower)?
+            .checked_add(offset)
+            .context("validity time overflow")?;
+        let upper_time = i64::try_from(upper)?
+            .checked_add(offset)
+            .context("validity time overflow")?;
         ensure!(
-            timestamp <= now + 30 && timestamp >= lower as i64 + offset,
-            "upload timestamp outside transaction window or in future"
+            timestamp >= lower_time && timestamp < upper_time,
+            "upload timestamp outside transaction window"
         );
+        if let Some(now) = now {
+            ensure!(
+                timestamp <= now.saturating_add(30),
+                "upload timestamp is in the future"
+            );
+        }
         ensure!(
             payload.instance == text(&meta["instance"])?
                 && payload.project == text(&meta["body"]["identifier"])?
@@ -343,8 +365,12 @@ impl Package {
             "network": self.network, "signer": self.signer, "feeLovelace": tx.transaction_body.fee,
             "validFromSlot": tx.transaction_body.validity_interval_start, "expiresAtSlot": tx.transaction_body.ttl,
             "outputs": outputs, "metadata": meta, "pdfSha256": self.file_sha256,
-            "evidenceUrl": self.evidence_url, "uploadAuthorization": self.payload()?,
-            "uploadAuthorizationAgeSeconds": Utc::now().timestamp()-DateTime::parse_from_rfc3339(&self.payload()?.timestamp)?.timestamp(),
+            "evidenceUrl": self.evidence_url,
+            "evidenceImportProfile": evidence::verify_url(&hex::decode(&self.file_hex)?, &self.evidence_url)?,
+            "uploadAuthorization": self.payload()?,
+            "validFromUtc": tx.transaction_body.validity_interval_start
+                .and_then(|s| DateTime::from_timestamp((s + offset) as i64, 0)).map(|d|d.to_rfc3339()),
+            "clockPolicy": "Offline integrity and signature checks do not use local time; online upload and submission must recheck validity.",
                 "inputs": refs(tx.transaction_body.inputs.iter().collect()),
                 "collateral": refs(tx.transaction_body.collateral.iter().flat_map(|s|s.iter()).collect()),
                 "remainingSigners": remaining_signers, "expiresAtUtc":expiry,
@@ -358,6 +384,14 @@ impl Package {
         signing: impl Fn(&[u8]) -> Result<([u8; 32], [u8; 64])>,
     ) -> Result<SignedPackage> {
         self.validate(now)?;
+        self.sign_offline(signing)
+    }
+
+    pub fn sign_offline(
+        &self,
+        signing: impl Fn(&[u8]) -> Result<([u8; 32], [u8; 64])>,
+    ) -> Result<SignedPackage> {
+        self.validate_offline()?;
         let hash: [u8; 32] = hex::decode(&self.body_hash)?
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid body hash"))?;
@@ -379,12 +413,17 @@ impl Package {
             transaction_witness: witness,
             upload_signature: cose::encode(&payload, &address, &vkey, &message_sig)?,
         };
-        self.verify(&signed, now)?;
+        self.verify_offline(&signed)?;
         Ok(signed)
     }
 
     pub fn verify(&self, signed: &SignedPackage, now: i64) -> Result<Vec<u8>> {
         self.validate(now)?;
+        self.verify_offline(signed)
+    }
+
+    pub fn verify_offline(&self, signed: &SignedPackage) -> Result<Vec<u8>> {
+        self.validate_offline()?;
         ensure!(
             signed.version == 1 && signed.request_hash == self.request_hash()?,
             "signed response/request mismatch"

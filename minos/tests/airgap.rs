@@ -19,9 +19,17 @@ fn fixture() -> (Package, SecretKey, i64) {
 
 fn package_for_signer(signer: &str, now: i64) -> Package {
     let file = b"%PDF-1.7\npublic test fixture\n%%EOF".to_vec();
+    package_with_file(signer, now, file, false)
+}
+
+fn package_with_file(signer: &str, now: i64, file: Vec<u8>, unixfs: bool) -> Package {
     let url = format!(
         "ipfs://{}",
-        minos::evidence::raw_cid(file.as_slice()).unwrap()
+        if unixfs {
+            minos::evidence::unixfs_cid(&file).unwrap()
+        } else {
+            minos::evidence::raw_cid(file.as_slice()).unwrap()
+        }
     );
     let (metadata, aux_hash) = metadata::encode_complete(
         &"a".repeat(56),
@@ -92,6 +100,41 @@ fn package_for_signer(signer: &str, now: i64) -> Package {
     .unwrap()
 }
 
+#[test]
+fn unixfs_package_preserves_both_signatures_and_rejects_changed_bytes_or_cid() {
+    let key = SecretKey::from([7; 32]);
+    let signer = hex::encode(Hasher::<224>::hash(key.public_key().as_ref()));
+    let now = chrono::Utc::now().timestamp();
+    let mut file = b"%PDF-1.7\npublic multichunk fixture\n".to_vec();
+    file.resize(407_316, 42);
+    let package = package_with_file(&signer, now, file, true);
+    let signed = sign(&package, &key, now);
+    package.verify(&signed, now).unwrap();
+    assert_eq!(
+        package.review().unwrap()["evidenceImportProfile"],
+        "unixfs-cidv1-256k-raw-leaves"
+    );
+    let receipt = airgap::upload_receipt(
+        &package,
+        &json!({"cid": package.evidence_url.strip_prefix("ipfs://").unwrap()}),
+    )
+    .unwrap();
+    assert_eq!(receipt["cidMatches"], true);
+    let mut changed = package.clone();
+    let mut bytes = hex::decode(&changed.file_hex).unwrap();
+    bytes[300_000] ^= 1;
+    changed.file_hex = hex::encode(&bytes);
+    changed.file_sha256 = airgap::sha256(&bytes);
+    assert!(changed.validate(now).is_err());
+    assert!(changed.verify(&signed, now).is_err());
+    let mut changed = package;
+    changed.evidence_url = format!(
+        "ipfs://{}",
+        minos::evidence::raw_cid(&hex::decode(&changed.file_hex).unwrap()[..]).unwrap()
+    );
+    assert!(changed.validate(now).is_err());
+}
+
 fn sign(p: &Package, key: &SecretKey, now: i64) -> airgap::SignedPackage {
     p.sign(now, |bytes| {
         Ok((
@@ -100,6 +143,77 @@ fn sign(p: &Package, key: &SecretKey, now: i64) -> airgap::SignedPackage {
         ))
     })
     .unwrap()
+}
+
+#[test]
+fn offline_signatures_ignore_clock_drift_but_online_validation_rejects_it() {
+    let (package, key, now) = fixture();
+    let hash = package.request_hash().unwrap();
+    package.validate_offline().unwrap();
+    let signed = package
+        .sign_offline(|message| {
+            Ok((
+                key.public_key().as_ref().try_into().unwrap(),
+                key.sign(message).as_ref().try_into().unwrap(),
+            ))
+        })
+        .unwrap();
+    package.verify_offline(&signed).unwrap();
+    package.verify(&signed, now).unwrap();
+    for drift in [-86_400, 86_400] {
+        assert!(package.validate(now + drift).is_err());
+        assert!(package.verify(&signed, now + drift).is_err());
+        package.validate_offline().unwrap();
+        package.verify_offline(&signed).unwrap();
+    }
+    assert_eq!(package.request_hash().unwrap(), hash);
+    let review = package.review().unwrap();
+    assert!(review["validFromUtc"].is_string());
+    assert!(review["expiresAtUtc"].is_string());
+    assert!(review.get("uploadAuthorizationAgeSeconds").is_none());
+
+    for offset in [-3600, 8000] {
+        let mut invalid = package.clone();
+        let mut payload = invalid.payload().unwrap();
+        payload.timestamp = chrono::DateTime::from_timestamp(now + offset, 0)
+            .unwrap()
+            .to_rfc3339();
+        invalid.upload_payload_hex = hex::encode(serde_json::to_vec(&payload).unwrap());
+        assert!(invalid.validate_offline().is_err());
+    }
+
+    // A structurally invalid validity window remains invalid even offline.
+    let mut raw = hex::decode(&package.tx_cbor_hex).unwrap();
+    let (lower, upper) = {
+        let tx = minos::metadata::transaction(&raw).unwrap();
+        (
+            tx.transaction_body.validity_interval_start.unwrap(),
+            tx.transaction_body.ttl.unwrap(),
+        )
+    };
+    let mut encoded = Encoder::new(Vec::new());
+    encoded.u64(upper).unwrap();
+    let encoded = encoded.into_writer();
+    let positions: Vec<_> = raw
+        .windows(encoded.len())
+        .enumerate()
+        .filter(|(_, value)| *value == encoded)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(positions.len(), 1);
+    let mut replacement = Encoder::new(Vec::new());
+    replacement.u64(lower).unwrap();
+    let replacement = replacement.into_writer();
+    assert_eq!(replacement.len(), encoded.len());
+    raw[positions[0]..positions[0] + encoded.len()].copy_from_slice(&replacement);
+    let mut invalid = package;
+    invalid.body_hash = hex::encode(sign::tx_body_hash(&raw).unwrap());
+    invalid.tx_cbor_hex = hex::encode(raw);
+    assert!(invalid
+        .validate_offline()
+        .unwrap_err()
+        .to_string()
+        .contains("validity window"));
 }
 
 #[test]
@@ -321,6 +435,21 @@ fn offline_cli_signs_both_with_gpg_encrypted_test_mnemonic() {
         .unwrap();
     assert!(child.wait().unwrap().success());
     let binary = env!("CARGO_BIN_EXE_minos");
+    let rejected_output = dir.join("wrong-hash-signed.json");
+    let mismatch = Command::new(binary)
+        .args(["airgap", "sign", "--package"])
+        .arg(&request)
+        .arg("--wallet")
+        .arg(dir.join("absent-wallet.asc"))
+        .arg("--expected-request-hash")
+        .arg("00".repeat(32))
+        .arg("--out")
+        .arg(&rejected_output)
+        .output()
+        .unwrap();
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("reviewed request hash mismatch"));
+    assert!(!rejected_output.exists());
     let review = Command::new(binary)
         .args(["airgap", "review", "--package"])
         .arg(&request)
@@ -339,11 +468,7 @@ fn offline_cli_signs_both_with_gpg_encrypted_test_mnemonic() {
         .arg(&request)
         .arg("--wallet")
         .arg(&wallet)
-        .args([
-            "--expected-request-hash",
-            &package.request_hash().unwrap(),
-            "--out",
-        ])
+        .arg("--out")
         .arg(&signed)
         .output()
         .unwrap();

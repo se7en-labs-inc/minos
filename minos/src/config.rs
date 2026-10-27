@@ -1,5 +1,22 @@
 use clap::ValueEnum;
 
+#[cfg(test)]
+mod tests {
+    use super::Network;
+
+    #[test]
+    fn normal_network_defaults_use_sundae_not_the_debug_portal() {
+        assert_eq!(
+            Network::Preview.portal_graphql_url(),
+            "https://api.treasury.preview.sundae.fi/graphql"
+        );
+        assert_eq!(
+            Network::Mainnet.portal_graphql_url(),
+            "https://api.treasury.sundae.fi/graphql"
+        );
+    }
+}
+
 #[derive(Clone, Debug, ValueEnum, Default)]
 pub enum Network {
     #[default]
@@ -9,7 +26,10 @@ pub enum Network {
 
 impl Network {
     pub fn portal_graphql_url(&self) -> &str {
-        "http://127.0.0.1:8080/graphql"
+        match self {
+            Network::Preview => "https://api.treasury.preview.sundae.fi/graphql",
+            Network::Mainnet => "https://api.treasury.sundae.fi/graphql",
+        }
     }
 
     pub fn koios_base_url(&self) -> &str {
