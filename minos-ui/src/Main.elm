@@ -1,4 +1,4 @@
-module Main exposing (main)
+module Main exposing (Model, Msg(..), WebData(..), assetAmountDecoder, deploymentStatus, init, instancesDecoder, main, statusDecoder, update)
 
 import Browser
 import Html exposing (..)
@@ -57,6 +57,8 @@ type alias Instance =
     , description : String
     , expirationMs : Maybe Int
     , projects : List Project
+    , confirmed : Bool
+    , referencesReady : Bool
     }
 
 
@@ -125,15 +127,19 @@ init flags =
 
 fetchInstances : String -> Cmd Msg
 fetchInstances portalUrl =
-    Http.post
-        { url = portalUrl
+    Http.request
+        { method = "POST"
+        , headers = []
+        , url = portalUrl
+        , timeout = Just 30000
+        , tracker = Nothing
         , body =
             Http.jsonBody
                 (E.object
                     [ ( "query"
                       , E.string """
-{ instances {
-    identifier label description
+{ apiVersion instances {
+    identifier label description confirmed referencesReady
     expiration { unixMilli }
     projects {
       identifier label
@@ -243,12 +249,20 @@ subscriptions _ =
 
 instancesDecoder : Decoder (List Instance)
 instancesDecoder =
-    D.at [ "data", "instances" ] (D.list instanceDecoder)
+    D.at [ "data", "apiVersion" ] D.int
+        |> D.andThen
+            (\version ->
+                if version == 2 then
+                    D.at [ "data", "instances" ] (D.list instanceDecoder)
+
+                else
+                    D.fail "Unsupported portal API version; version 2 is required"
+            )
 
 
 instanceDecoder : Decoder Instance
 instanceDecoder =
-    D.map5 Instance
+    D.map7 Instance
         (D.field "identifier" D.string)
         (D.field "label" D.string)
         (D.field "description" D.string)
@@ -258,6 +272,8 @@ instanceDecoder =
             )
         )
         (D.field "projects" (D.list projectDecoder))
+        (D.field "confirmed" D.bool)
+        (D.field "referencesReady" D.bool)
 
 
 projectDecoder : Decoder Project
@@ -279,7 +295,7 @@ milestoneDecoder =
         (D.at [ "maturation", "unixMilli" ] D.string
             |> D.map (String.toInt >> Maybe.withDefault 0)
         )
-        (D.field "status" D.string)
+        (D.field "status" statusDecoder)
         (D.field "requiresEvidence" D.bool)
         (D.field "completions" (D.list completionDecoder))
 
@@ -311,6 +327,19 @@ assetAmountDecoder =
     D.map2 AssetAmount
         (D.field "assetId" D.string)
         (D.field "quantity" D.string)
+
+
+statusDecoder : Decoder String
+statusDecoder =
+    D.string
+        |> D.andThen
+            (\status ->
+                if List.member status [ "Active", "Matured", "Paused", "Withdrawn", "Unresolved", "Unavailable" ] then
+                    D.succeed status
+
+                else
+                    D.fail ("Unsupported milestone status: " ++ status)
+            )
 
 
 
@@ -709,12 +738,28 @@ viewInstances model instances =
         div [] (List.map (viewInstance model) instances)
 
 
+deploymentStatus : Instance -> String
+deploymentStatus inst =
+    if inst.confirmed && inst.referencesReady then
+        "confirmed"
+
+    else if inst.confirmed then
+        "references pending"
+
+    else
+        "pending confirmation"
+
+
 viewInstance : Model -> Instance -> Html Msg
 viewInstance model inst =
     div [ class "instance" ]
         [ div [ class "instance-heading" ]
             [ span [ class "instance-title" ] [ text inst.label ]
             , span [ class "instance-id" ] [ text (shortHash inst.identifier) ]
+            , span [ class "badge" ]
+                [ text
+                    (deploymentStatus inst)
+                ]
             ]
         , div [ class "instance-meta" ]
             (case inst.expirationMs of
@@ -905,11 +950,15 @@ viewMilestone now idx ms =
                 "Paused" ->
                     span [ class "badge badge-paused" ] [ text "paused" ]
 
+                "Matured" ->
+                    span [ class "badge badge-ready" ] [ text "ready" ]
+
                 "Withdrawn" ->
                     span [ class "badge badge-withdrawn" ] [ text "withdrawn" ]
 
                 other ->
                     span [ class "badge" ] [ text (String.toLower other) ]
+
         rowClass =
             if ms.status == "Withdrawn" then
                 "ms-row ms-row-withdrawn"

@@ -9,7 +9,9 @@ pub struct Portal {
 impl Portal {
     pub fn new(url: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client_builder()
+                .build()
+                .expect("HTTP client configuration"),
             url: url.to_string(),
         }
     }
@@ -27,22 +29,29 @@ impl Portal {
             .send()
             .await
             .context("portal request failed")?;
-        let val: Value = resp.json().await.context("portal response parse failed")?;
+        let val: Value = crate::http::json(resp)
+            .await
+            .context("portal response parse failed")?;
         if let Some(errors) = val.get("errors") {
             anyhow::bail!("GraphQL errors: {errors}");
         }
-        Ok(val["data"].clone())
+        val.get("data")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .context("portal response has no data")
     }
 
     pub async fn instances(&self) -> Result<Vec<Instance>> {
         let q = r#"
             query {
+                apiVersion
                 instances {
-                    identifier label description
+                    identifier label description confirmed
                     expiration { unixMilli }
                     payoutUpperbound { unixMilli }
                     vendorExpiration { unixMilli }
                     registry {
+                        registryReference { transaction index }
                         treasuryScript { scriptHash scriptReference { transaction index } }
                         vendorScript   { scriptHash scriptReference { transaction index } }
                     }
@@ -50,6 +59,10 @@ impl Portal {
             }
         "#;
         let data = self.query(q, None).await?;
+        anyhow::ensure!(
+            data["apiVersion"] == 2,
+            "unsupported portal API version; version 2 is required"
+        );
         let arr = data["instances"]
             .as_array()
             .context("instances: expected array")?;
@@ -59,12 +72,14 @@ impl Portal {
     pub async fn instance_by_id(&self, id: &str) -> Result<Instance> {
         let q = r#"
             query InstanceById($id: String!) {
+                apiVersion
                 instanceById(ID: $id) {
-                    identifier label description
+                    identifier label description confirmed
                     expiration { unixMilli }
                     payoutUpperbound { unixMilli }
                     vendorExpiration { unixMilli }
                     registry {
+                        registryReference { transaction index }
                         treasuryScript { scriptHash scriptReference { transaction index } }
                         vendorScript   { scriptHash scriptReference { transaction index } }
                     }
@@ -87,7 +102,16 @@ impl Portal {
         "#;
         let vars = json!({ "id": id });
         let data = self.query(q, Some(vars)).await?;
-        parse_instance(&data["instanceById"])
+        anyhow::ensure!(
+            data["apiVersion"] == 2,
+            "unsupported portal API version; version 2 is required"
+        );
+        let instance = parse_instance(&data["instanceById"])?;
+        anyhow::ensure!(
+            instance.confirmed,
+            "instance is registered but its publication is not confirmed"
+        );
+        Ok(instance)
     }
 
     /// Uses the explicit registration-only mutation. Never fall back to a remote
@@ -253,6 +277,7 @@ pub struct TxOutRef {
 
 #[derive(Debug, Clone)]
 pub struct RegistryInfo {
+    pub registry_reference: Option<TxOutRef>,
     pub treasury_script: ScriptInfo,
     pub vendor_script: ScriptInfo,
 }
@@ -261,7 +286,7 @@ pub struct RegistryInfo {
 pub struct AssetValue {
     /// Empty string for lovelace; "<policyId><assetName>" for native assets
     pub asset_id: String,
-    pub quantity: i64,
+    pub quantity: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +327,8 @@ pub enum MilestoneStatus {
     Paused,
     Withdrawn,
     Cancelled,
+    Unresolved,
+    Unavailable,
 }
 
 impl std::fmt::Display for MilestoneStatus {
@@ -311,6 +338,8 @@ impl std::fmt::Display for MilestoneStatus {
             MilestoneStatus::Paused => write!(f, "Paused"),
             MilestoneStatus::Withdrawn => write!(f, "Withdrawn"),
             MilestoneStatus::Cancelled => write!(f, "Cancelled"),
+            MilestoneStatus::Unresolved => write!(f, "Unresolved"),
+            MilestoneStatus::Unavailable => write!(f, "Unavailable"),
         }
     }
 }
@@ -335,6 +364,7 @@ pub struct Instance {
     pub vendor_expiration_ms: u64,
     pub registry: RegistryInfo,
     pub projects: Vec<Project>,
+    pub confirmed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +376,9 @@ fn parse_instance(v: &Value) -> Result<Instance> {
         identifier: str(v, "identifier")?,
         label: str(v, "label")?,
         description: str(v, "description")?,
+        confirmed: v["confirmed"]
+            .as_bool()
+            .context("missing instance confirmation state")?,
         expiration_ms: posix_ms(v, "expiration")?,
         payout_upperbound_ms: posix_ms(v, "payoutUpperbound")?,
         vendor_expiration_ms: posix_ms(v, "vendorExpiration")?,
@@ -360,6 +393,16 @@ fn parse_instance(v: &Value) -> Result<Instance> {
 
 fn parse_registry(v: &Value) -> Result<RegistryInfo> {
     Ok(RegistryInfo {
+        registry_reference: if v["registryReference"].is_null() {
+            None
+        } else {
+            Some(TxOutRef {
+                transaction: str(&v["registryReference"], "transaction")?,
+                index: v["registryReference"]["index"]
+                    .as_u64()
+                    .context("registry reference index")?,
+            })
+        },
         treasury_script: parse_script(&v["treasuryScript"])?,
         vendor_script: parse_script(&v["vendorScript"])?,
     })
@@ -405,16 +448,15 @@ fn parse_project(v: &Value) -> Result<Project> {
 }
 
 fn parse_milestone(v: &Value) -> Result<Milestone> {
-    let raw_status = v["status"].as_str().unwrap_or("Active");
+    let raw_status = v["status"].as_str().context("missing milestone status")?;
     let status = match raw_status {
         "ACTIVE" | "Active" | "MATURED" | "Matured" => MilestoneStatus::Active,
         "PAUSED" | "Paused" => MilestoneStatus::Paused,
         "WITHDRAWN" | "Withdrawn" => MilestoneStatus::Withdrawn,
         "CANCELLED" | "Cancelled" => MilestoneStatus::Cancelled,
-        other => {
-            eprintln!("warn: unknown milestone status '{other}', treating as Active");
-            MilestoneStatus::Active
-        }
+        "UNRESOLVED" | "Unresolved" => MilestoneStatus::Unresolved,
+        "UNAVAILABLE" | "Unavailable" => MilestoneStatus::Unavailable,
+        other => anyhow::bail!("unsupported milestone status '{other}'; update the client"),
     };
     Ok(Milestone {
         identifier: str(v, "identifier")?,
@@ -452,7 +494,7 @@ fn parse_completion(v: &Value) -> Result<Completion> {
 }
 
 fn parse_project_output(v: &Value) -> Result<ProjectOutput> {
-    Ok(ProjectOutput {
+    let output = ProjectOutput {
         transaction: str(v, "transaction")?,
         index: v["index"].as_u64().context("output.index")?,
         address: str(v, "address")?,
@@ -464,7 +506,7 @@ fn parse_project_output(v: &Value) -> Result<ProjectOutput> {
                     .map(|a| {
                         let qty_raw = &a["quantity"];
                         let quantity = qty_raw
-                            .as_i64()
+                            .as_u64()
                             .or_else(|| qty_raw.as_str().and_then(|s| s.parse().ok()))
                             .context("value.quantity")?;
                         Ok(AssetValue {
@@ -476,7 +518,14 @@ fn parse_project_output(v: &Value) -> Result<ProjectOutput> {
             })
             .transpose()?
             .unwrap_or_default(),
-    })
+    };
+    crate::tx::value::Value::from_quantities(
+        output
+            .value
+            .iter()
+            .map(|value| (value.asset_id.as_str(), value.quantity)),
+    )?;
+    Ok(output)
 }
 
 /// Normalize portal assetId to our internal format.
@@ -487,9 +536,9 @@ fn normalize_asset_id(raw: &str) -> String {
         return String::new();
     }
     if let Some(dot) = raw.find('.') {
-        return format!("{}{}", &raw[..dot], &raw[dot + 1..]);
+        return format!("{}{}", &raw[..dot], &raw[dot + 1..]).to_ascii_lowercase();
     }
-    raw.to_string()
+    raw.to_ascii_lowercase()
 }
 
 fn str(v: &Value, key: &str) -> Result<String> {
@@ -508,4 +557,39 @@ fn posix_ms(v: &Value, key: &str) -> Result<u64> {
     raw.as_str()
         .and_then(|s| s.parse().ok())
         .with_context(|| format!("missing unixMilli on '{key}'"))
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    #[test]
+    fn uncertain_statuses_remain_explicit_and_unknown_statuses_fail() {
+        let mut milestone = json!({"identifier":"m-10","label":"ten","description":"","acceptanceCriteria":"","maturation":{"unixMilli":"0"},"status":"Unresolved","completions":[]});
+        assert_eq!(
+            parse_milestone(&milestone).unwrap().status,
+            MilestoneStatus::Unresolved
+        );
+        milestone["status"] = "Unavailable".into();
+        assert_eq!(
+            parse_milestone(&milestone).unwrap().status,
+            MilestoneStatus::Unavailable
+        );
+        milestone["status"] = "FutureStatus".into();
+        assert!(parse_milestone(&milestone).is_err());
+        milestone.as_object_mut().unwrap().remove("status");
+        assert!(parse_milestone(&milestone).is_err());
+    }
+    #[test]
+    fn full_unsigned_asset_range_is_preserved_and_malformed_values_fail() {
+        let mut output = json!({"transaction":"01".repeat(32),"index":0,"address":"synthetic","datumHex":"00","value":[{"assetId":"","quantity":"18446744073709551615"},{"assetId":"ab".repeat(28),"quantity":"18446744073709551615"}]});
+        assert_eq!(
+            parse_project_output(&output).unwrap().value[1].quantity,
+            u64::MAX
+        );
+        output["value"][0]["quantity"] = "-1".into();
+        assert!(parse_project_output(&output).is_err());
+        output["value"][0]["quantity"] = "1".into();
+        output["value"][1]["assetId"] = "".into();
+        assert!(parse_project_output(&output).is_err());
+    }
 }

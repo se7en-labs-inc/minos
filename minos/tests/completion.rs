@@ -38,6 +38,7 @@ fn fixture() -> (complete::CompleteParams, Vec<Utxo>, ProtocolParams) {
     let datum = minos::types::VendorDatum::from_cbor_hex(&vendor.datum_hex().unwrap()).unwrap();
     let assets = vendor.asset_list.as_ref().unwrap();
     let params = complete::CompleteParams {
+        coins_per_utxo_byte: 4310,
         vendor_utxo_hash: vendor.tx_hash.clone(),
         vendor_utxo_index: vendor.tx_index,
         vendor_address: vendor.address.clone(),
@@ -64,8 +65,8 @@ fn fixture() -> (complete::CompleteParams, Vec<Utxo>, ProtocolParams) {
         staking_script_refs: vec![],
         staking_reward_mem: 2_500_000,
         staking_reward_steps: 900_000_000,
-        fee_inputs: vec![WalletUtxo::from(fee)],
-        collateral: WalletUtxo::from(collateral),
+        fee_inputs: vec![WalletUtxo::try_from(fee).unwrap()],
+        collateral: WalletUtxo::try_from(collateral).unwrap(),
         fee_addr: fee.address.clone(),
         fee: 1_000_000,
         change_lovelace: fee.lovelace() - 1_000_000,
@@ -73,12 +74,13 @@ fn fixture() -> (complete::CompleteParams, Vec<Utxo>, ProtocolParams) {
         invalid_from_slot: 200_007_200,
         v3_cost_model: proto.v3_cost_model().unwrap(),
         instance_id: "51486a2f1496d4d3a688a9b111971aa9b731ed045d900b601345ca4e".into(),
-        project_id: "CTW-26-0024".into(),
+        project_id: "EXAMPLE-001".into(),
         milestone_id: "m-7".into(),
         description: "Signed MAF".into(),
-        evidence_urls: vec![
-            "ipfs://bafkreie7seeoksdv35exxjwtrfn6tt76tr6pbyi7y7jmfzat4wm3wfbjgq".into(),
-        ],
+        evidence_urls: vec![format!(
+            "ipfs://{}",
+            minos::evidence::raw_cid(b"synthetic evidence".as_slice()).unwrap()
+        )],
         evidence_labels: vec![],
         network_id: 1,
     };
@@ -365,4 +367,128 @@ fn completion_rejects_missing_or_malformed_vendor_author() {
             .to_string()
             .contains("28-byte"));
     }
+}
+
+fn evaluate_authorization(
+    params: complete::CompleteParams,
+    inputs: &[Utxo],
+    proto: &ProtocolParams,
+) -> anyhow::Result<minos::preflight::Report> {
+    let bytes = hex::decode(complete::build(params)?.cbor_hex)?;
+    let tx: Tx<'_> = minicbor::decode(&bytes)?;
+    let needed: std::collections::BTreeSet<_> = tx
+        .transaction_body
+        .inputs
+        .iter()
+        .chain(
+            tx.transaction_body
+                .reference_inputs
+                .iter()
+                .flat_map(|v| v.iter()),
+        )
+        .chain(tx.transaction_body.collateral.iter().flat_map(|v| v.iter()))
+        .map(|i| (i.transaction_id.to_string(), i.index))
+        .collect();
+    let resolved: Vec<_> = inputs
+        .iter()
+        .filter(|u| needed.contains(&(u.tx_hash.clone(), u.tx_index)))
+        .cloned()
+        .collect();
+    minos::preflight::evaluate(
+        &bytes,
+        &resolved,
+        proto.evaluation_limits()?,
+        &proto.v3_cost_model().expect("fixture cost model"),
+        1_591_566_291,
+    )
+}
+
+#[test]
+fn completion_accepts_a_threshold_subset_and_rejects_insufficient_signers() {
+    let (mut params, mut inputs, proto) = fixture();
+    let mut datum = minos::types::VendorDatum::from_cbor_hex(&params.vendor_datum_hex).unwrap();
+    datum.vendor = minos::types::MultisigScript::AtLeast {
+        required: 2,
+        scripts: (1..=3)
+            .map(|key| minos::types::MultisigScript::Signature {
+                key_hash: vec![key; 28],
+            })
+            .collect(),
+    };
+    params.vendor_datum_hex = hex::encode(datum.to_cbor_bytes());
+    let vendor = inputs
+        .iter_mut()
+        .find(|u| u.tx_hash == params.vendor_utxo_hash)
+        .unwrap();
+    vendor.inline_datum = Some(serde_json::json!({"bytes": params.vendor_datum_hex}));
+    vendor.output_cbor = None;
+    params.vendor_key_hashes = vec![vec![1; 28], vec![2; 28]];
+    params.staking_script_hashes =
+        vec![
+            hex::decode("326cec60e7bcf3673b02f8684802febdcf27cad1601d75182ad6a5bb")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        ];
+    params.staking_script_refs = vec![(
+        "aaec1b8402f1d7951a86a13ed05114baf32549841a5c288d8580b367bb5063c8".into(),
+        0,
+    )];
+    assert_eq!(
+        evaluate_authorization(params.clone(), &inputs, &proto)
+            .unwrap()
+            .redeemers,
+        2
+    );
+    params.vendor_key_hashes.pop();
+    assert!(evaluate_authorization(params, &inputs, &proto).is_err());
+}
+
+#[test]
+fn completion_supports_script_only_vendor_with_an_explicit_metadata_actor() {
+    let (mut params, mut inputs, proto) = fixture();
+    let script = hex::decode("326cec60e7bcf3673b02f8684802febdcf27cad1601d75182ad6a5bb").unwrap();
+    let mut datum = minos::types::VendorDatum::from_cbor_hex(&params.vendor_datum_hex).unwrap();
+    datum.vendor = minos::types::MultisigScript::Script {
+        script_hash: script.clone(),
+    };
+    params.vendor_datum_hex = hex::encode(datum.to_cbor_bytes());
+    let vendor = inputs
+        .iter_mut()
+        .find(|u| u.tx_hash == params.vendor_utxo_hash)
+        .unwrap();
+    vendor.inline_datum = Some(serde_json::json!({"bytes": params.vendor_datum_hex}));
+    vendor.output_cbor = None;
+    assert!(evaluate_authorization(params.clone(), &inputs, &proto).is_err());
+    params.staking_script_hashes = vec![script.try_into().unwrap()];
+    params.staking_script_refs = vec![(
+        "aaec1b8402f1d7951a86a13ed05114baf32549841a5c288d8580b367bb5063c8".into(),
+        0,
+    )];
+    assert_eq!(
+        evaluate_authorization(params, &inputs, &proto)
+            .unwrap()
+            .redeemers,
+        2
+    );
+}
+
+#[test]
+fn completion_funds_large_datum_minimum_from_wallet_without_losing_assets() {
+    let (mut params, _, _) = fixture();
+    params.coins_per_utxo_byte = 20_000;
+    params.vendor_value_lovelace = 1;
+    params.change_lovelace = 50_000_000;
+    let bytes = hex::decode(complete::build(params.clone()).unwrap().cbor_hex).unwrap();
+    let tx: Tx<'_> = minicbor::decode(&bytes).unwrap();
+    let vendor = MultiEraOutput::from_conway(&tx.transaction_body.outputs[0]);
+    let change = MultiEraOutput::from_conway(&tx.transaction_body.outputs[1]);
+    assert!(vendor.value().coin() > 2_000_000);
+    assert_eq!(vendor.value().coin() + change.value().coin(), 50_000_001);
+    assert_eq!(vendor.value().assets().len(), 1);
+    params.change_lovelace = 0;
+    assert!(complete::build(params)
+        .unwrap_err()
+        .to_string()
+        .contains("minimum ADA"));
 }

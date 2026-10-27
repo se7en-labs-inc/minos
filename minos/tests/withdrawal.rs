@@ -239,14 +239,14 @@ fn real_withdrawal_without_treasury_reference_passes_preflight() {
     .is_err());
 }
 
-#[test]
-fn withdrawal_builder_includes_only_required_references() {
-    use minos::tx::withdraw::{build, WithdrawParams};
+fn withdrawal_params() -> minos::tx::withdraw::WithdrawParams {
+    use minos::tx::withdraw::WithdrawParams;
     let us = inputs();
     let get = |prefix: &str| us.iter().find(|u| u.tx_hash.starts_with(prefix)).unwrap();
     let vendor = get("1804");
     let fee = get("70c6");
-    let built = build(WithdrawParams {
+    WithdrawParams {
+        coins_per_utxo_byte: 4310,
         vendor_utxo_hash: vendor.tx_hash.clone(),
         vendor_utxo_index: 0,
         vendor_address: vendor.address.clone(),
@@ -260,8 +260,8 @@ fn withdrawal_builder_includes_only_required_references() {
         vendor_script_ref_hash: get("c307").tx_hash.clone(),
         vendor_script_ref_index: 0,
         vendor_key_hashes: vec![vec![7; 28]],
-        fee_inputs: vec![fee.into()],
-        collateral: get("ff9d").into(),
+        fee_inputs: vec![fee.try_into().unwrap()],
+        collateral: get("ff9d").try_into().unwrap(),
         fee_addr: fee.address.clone(),
         fee: 1_000_000,
         change_lovelace: 17_000_000,
@@ -280,8 +280,37 @@ fn withdrawal_builder_includes_only_required_references() {
         staking_script_refs: vec![(get("aaec").tx_hash.clone(), 0)],
         staking_reward_mem: 2_500_000,
         staking_reward_steps: 900_000_000,
-    })
-    .unwrap();
+    }
+}
+
+#[test]
+fn additional_reward_scripts_are_rejected_before_overwriting_withdrawals() {
+    let mut parameters = withdrawal_params();
+    parameters.staking_script_hashes.push([1; 28]);
+    parameters.staking_script_refs.push(("02".repeat(32), 0));
+    let error = minos::tx::withdraw::build(parameters).err().unwrap();
+    assert!(format!("{error:#}").contains("multiple reward withdrawals"));
+
+    let built = minos::tx::withdraw::build(withdrawal_params()).unwrap();
+    let bytes = hex::decode(built.cbor_hex).unwrap();
+    assert!(minos::tx::cbor_util::add_treasury_withdrawal(
+        &bytes,
+        &[1; 28],
+        1,
+        1,
+        1,
+        &params().v3_cost_model().unwrap()
+    )
+    .is_err());
+    let tx: Tx<'_> = minicbor::decode(&bytes).unwrap();
+    assert_eq!(tx.transaction_body.withdrawals.as_ref().unwrap().len(), 1);
+}
+
+#[test]
+fn withdrawal_builder_includes_only_required_references() {
+    let us = inputs();
+    let get = |prefix: &str| us.iter().find(|u| u.tx_hash.starts_with(prefix)).unwrap();
+    let built = minos::tx::withdraw::build(withdrawal_params()).unwrap();
     let bytes = hex::decode(built.cbor_hex).unwrap();
     let tx: Tx<'_> = minicbor::decode(&bytes).unwrap();
     let actual: std::collections::BTreeSet<_> = tx
@@ -310,6 +339,163 @@ fn withdrawal_builder_includes_only_required_references() {
         .any(|s| s.as_ref() == [7; 28]));
     assert!(minos::tx::metadata::encode_withdraw("instance", "").is_err());
     assert!(minos::tx::metadata::encode_withdraw("instance", &"07".repeat(27)).is_err());
+}
+
+#[test]
+fn final_payout_preserves_residual_ada_and_unscheduled_assets_under_real_scripts() {
+    use minos::{
+        tx::{value::Value, withdraw},
+        types::{AssetBundle, Payout, PayoutStatus, VendorDatum},
+    };
+    for (residual_coin, unscheduled_tokens) in [(0, false), (3_000_000, false), (3_000_000, true)] {
+        let mut us = inputs();
+        let original_bytes = original();
+        let original_tx: Tx<'_> = minicbor::decode(&original_bytes).unwrap();
+        let start = original_tx
+            .transaction_body
+            .validity_interval_start
+            .unwrap();
+        let destination =
+            pallas_traverse::MultiEraOutput::from_conway(&original_tx.transaction_body.outputs[0])
+                .address()
+                .unwrap()
+                .to_bech32()
+                .unwrap();
+        let vendor = us
+            .iter_mut()
+            .find(|u| u.tx_hash.starts_with("1804"))
+            .unwrap();
+        let mut datum = VendorDatum::from_cbor_hex(&vendor.datum_hex().unwrap()).unwrap();
+        let mut payout_value = std::collections::BTreeMap::new();
+        payout_value.insert(
+            vec![],
+            std::collections::BTreeMap::from([(
+                vec![],
+                (vendor.lovelace() - residual_coin) as i64,
+            )]),
+        );
+        for asset in vendor.asset_list.as_ref().unwrap() {
+            payout_value
+                .entry(hex::decode(&asset.policy_id).unwrap())
+                .or_insert_with(std::collections::BTreeMap::new)
+                .insert(
+                    hex::decode(&asset.asset_name).unwrap(),
+                    asset.quantity.parse().unwrap(),
+                );
+        }
+        if unscheduled_tokens {
+            let mut extra = vendor.asset_list.as_ref().unwrap()[0].clone();
+            extra.policy_id = "ab".repeat(28);
+            extra.asset_name = "01".into();
+            extra.quantity = "5".into();
+            vendor.asset_list.as_mut().unwrap().push(extra);
+        }
+        datum.payouts = vec![Payout {
+            maturation: (start + 1_591_566_291) * 1000 - 1,
+            value: AssetBundle(payout_value),
+            status: PayoutStatus::Active,
+        }];
+        vendor.inline_datum =
+            Some(serde_json::json!({"bytes": hex::encode(datum.to_cbor_bytes())}));
+        vendor.output_cbor = None;
+        let paid = Value::from_payouts(&datum.payouts).unwrap();
+        let vendor_value = Value {
+            coin: vendor.lovelace(),
+            assets: vendor
+                .asset_list
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|a| {
+                    (
+                        format!("{}{}", a.policy_id, a.asset_name),
+                        a.quantity.parse().unwrap(),
+                    )
+                })
+                .collect(),
+        };
+        let residual = vendor_value.checked_sub(&paid).unwrap();
+        let mut build = withdrawal_params();
+        build.vendor_key_hashes = datum.vendor.key_hashes();
+        build.valid_from_slot = start;
+        build.invalid_from_slot = original_tx.transaction_body.ttl.unwrap();
+        build.dest_addr = destination;
+        build.matured_lovelace = paid.coin;
+        build.matured_assets = paid.assets.into_iter().collect();
+        build.remaining_datum_bytes = withdraw::continuing_datum(&datum, vec![], &residual);
+        build.remaining_lovelace = residual.coin;
+        build.remaining_assets = residual.assets.into_iter().collect();
+        // A fee input with an unrelated token must return it as wallet change.
+        let fee_asset = minos::koios::AssetListItem {
+            policy_id: "cd".repeat(28),
+            asset_name: "0203".into(),
+            quantity: "17".into(),
+        };
+        let fee = us
+            .iter_mut()
+            .find(|u| u.tx_hash == build.fee_inputs[0].tx_hash)
+            .unwrap();
+        fee.asset_list = Some(vec![fee_asset]);
+        build.fee_inputs[0] = (&*fee).try_into().unwrap();
+        build.change_lovelace =
+            build.fee_inputs.iter().map(|u| u.lovelace).sum::<u64>() - build.fee;
+        let built = withdraw::build(build).unwrap();
+        let bytes = hex::decode(built.cbor_hex).unwrap();
+        us.retain(|u| !u.tx_hash.starts_with("944e78"));
+        let protocol = params();
+        preflight::evaluate(
+            &bytes,
+            &us,
+            protocol.evaluation_limits().unwrap(),
+            &protocol.v3_cost_model().unwrap(),
+            1_591_566_291,
+        )
+        .unwrap();
+        let tx: Tx<'_> = minicbor::decode(&bytes).unwrap();
+        let change = pallas_traverse::MultiEraOutput::from_conway(
+            tx.transaction_body.outputs.last().unwrap(),
+        );
+        assert!(change
+            .value()
+            .assets()
+            .iter()
+            .any(|p| p.policy().as_ref() == [0xcd; 28]
+                && p.assets()
+                    .iter()
+                    .any(|a| a.name() == [2, 3] && a.any_coin() == 17)));
+        if residual_coin > 0 {
+            let output =
+                pallas_traverse::MultiEraOutput::from_conway(&tx.transaction_body.outputs[1]);
+            assert_eq!(output.value().coin(), residual_coin);
+            let pallas_primitives::conway::TransactionOutput::PostAlonzo(output) =
+                &tx.transaction_body.outputs[1]
+            else {
+                panic!("inline remaining output required")
+            };
+            let pallas_primitives::conway::DatumOption::Data(data) =
+                &**output.datum_option.as_ref().unwrap()
+            else {
+                panic!("inline datum required")
+            };
+            assert!(
+                VendorDatum::from_cbor_hex(&hex::encode(minicbor::to_vec(&data.0).unwrap()))
+                    .unwrap()
+                    .payouts
+                    .is_empty()
+            );
+            if unscheduled_tokens {
+                let output =
+                    pallas_traverse::MultiEraOutput::from_conway(&tx.transaction_body.outputs[1]);
+                let value = output.value();
+                assert!(value
+                    .assets()
+                    .iter()
+                    .any(|policy| policy.policy().as_ref() == [0xab; 28]));
+            }
+        } else {
+            assert_eq!(tx.transaction_body.outputs.len(), 2);
+        }
+    }
 }
 
 fn synthetic(script_source: &str, mem: u64) -> (Vec<u8>, Vec<Utxo>) {

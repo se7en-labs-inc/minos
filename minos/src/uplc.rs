@@ -107,8 +107,10 @@ mod tests {
         eprintln!("CBOR-wrapped matches: {}", cbor_matches);
         eprintln!("Raw flat matches:     {}", flat_matches);
 
-        // One of them must match
-        assert!(cbor_matches || flat_matches, "neither hash format matches!");
+        assert!(
+            cbor_matches,
+            "ledger hash must use the CBOR-wrapped program"
+        );
     }
 
     #[test]

@@ -64,11 +64,11 @@ pub fn run(command: AirgapCmd) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&package.review()?)?);
             let mnemonic = wallet::load_mnemonic(&path)?;
             ensure!(
-                hex::encode(wallet::payment_key_hash(&mnemonic, account)) == package.signer,
+                hex::encode(wallet::payment_key_hash(&mnemonic, account)?) == package.signer,
                 "wallet/account does not match vendor signer"
             );
             let signed = package.sign(chrono::Utc::now().timestamp(), |message| {
-                Ok(wallet::sign_tx_body(&mnemonic, account, message))
+                wallet::sign_tx_body(&mnemonic, account, message)
             })?;
             airgap::write_new(&out, &signed)?;
             println!("Wrote both vendor signatures to {}", out.display());

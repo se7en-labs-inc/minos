@@ -16,8 +16,12 @@ pub struct Instance {
     pub vendor_hash: String,
     pub treasury_ref: Option<TxOutRef>,
     pub vendor_ref: Option<TxOutRef>,
+    #[serde(default)]
+    pub registry_ref: Option<TxOutRef>,
     pub publish_tx: String,
     pub network: String,
+    #[serde(default)]
+    pub confirmed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +33,8 @@ pub struct Project {
     pub vendor_label: String,
     pub milestones: Vec<Milestone>,
     pub fund_tx: String,
+    #[serde(default)]
+    pub ordered_milestones: bool,
 }
 
 fn default_true() -> bool {
@@ -48,6 +54,7 @@ pub struct Milestone {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VendorUtxo {
+    pub instance_id: String,
     pub tx_hash: String,
     pub output_index: u64,
     pub project_id: String,
@@ -56,6 +63,8 @@ pub struct VendorUtxo {
     pub lovelace: u64,
     pub assets: Vec<AssetAmount>,
     pub slot: u64,
+    #[serde(default)]
+    pub payout_ids: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +101,7 @@ pub enum EventType {
     Publish,
     Fund,
     Complete,
+    Adjudicate,
     Withdraw,
     Pause,
     Resume,
@@ -109,6 +119,7 @@ impl EventType {
             "publish" => Some(Self::Publish),
             "fund" => Some(Self::Fund),
             "complete" => Some(Self::Complete),
+            "adjudicate" => Some(Self::Adjudicate),
             "withdraw" => Some(Self::Withdraw),
             "pause" => Some(Self::Pause),
             "resume" => Some(Self::Resume),
@@ -127,6 +138,7 @@ impl EventType {
             Self::Publish => "publish",
             Self::Fund => "fund",
             Self::Complete => "complete",
+            Self::Adjudicate => "adjudicate",
             Self::Withdraw => "withdraw",
             Self::Pause => "pause",
             Self::Resume => "resume",
@@ -150,7 +162,8 @@ pub enum MilestoneStatus {
     Matured,
     Paused,
     Withdrawn,
-    Cancelled,
+    Unresolved,
+    Unavailable,
 }
 
 // ---------------------------------------------------------------------------

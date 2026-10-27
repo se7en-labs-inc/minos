@@ -16,6 +16,7 @@ use super::UnsignedTx;
 use crate::scripts::base_script_addr;
 use crate::types::{AssetBundle, MultisigScript, Payout, PayoutStatus, VendorDatum};
 
+#[derive(Clone)]
 pub struct MilestoneSpec {
     pub id: String,
     pub label: String,
@@ -27,6 +28,7 @@ pub struct MilestoneSpec {
     pub token_amount: u64,
 }
 
+#[derive(Clone)]
 pub struct FundInput {
     pub tx_hash: String,
     pub output_index: u64,
@@ -34,6 +36,7 @@ pub struct FundInput {
     pub token_amount: u64,
 }
 
+#[derive(Clone)]
 pub struct FundParams {
     pub treasury: Option<TreasurySpend>,
     pub instance_id: String,
@@ -58,11 +61,13 @@ pub struct FundParams {
     pub extra_change_assets: Vec<(Vec<u8>, Vec<u8>, u64)>,
     pub fee_addr: String,
     pub fee: u64,
+    pub coins_per_utxo_byte: u64,
     pub valid_from_slot: u64,
     pub invalid_from_slot: u64,
     pub network_id: u8,
 }
 
+#[derive(Clone)]
 pub struct TreasurySpend {
     pub input: crate::references::OutRef,
     pub references: Vec<crate::references::OutRef>,
@@ -71,6 +76,243 @@ pub struct TreasurySpend {
     pub return_address: String,
     pub return_lovelace: u64,
     pub return_assets: Vec<(Vec<u8>, Vec<u8>, u64)>,
+}
+
+pub fn project_datum(
+    vendor: &[u8],
+    milestones: &[MilestoneSpec],
+    token_policy: Option<&[u8]>,
+    token_name: Option<&[u8]>,
+) -> Result<VendorDatum> {
+    anyhow::ensure!(vendor.len() == 28, "vendor key hash must be 28 bytes");
+    let mut payouts = Vec::new();
+    for milestone in milestones {
+        let mut value = BTreeMap::new();
+        if milestone.lovelace > 0 {
+            value.insert(
+                vec![],
+                BTreeMap::from([(
+                    vec![],
+                    i64::try_from(milestone.lovelace)
+                        .context("payout ADA exceeds signed datum range")?,
+                )]),
+            );
+        }
+        if milestone.token_amount > 0 {
+            let policy = token_policy
+                .context("missing payout token policy")?
+                .to_vec();
+            let name = token_name.context("missing payout token name")?.to_vec();
+            value.insert(
+                policy,
+                BTreeMap::from([(
+                    name,
+                    i64::try_from(milestone.token_amount)
+                        .context("payout tokens exceed signed datum range")?,
+                )]),
+            );
+        }
+        payouts.push(Payout {
+            maturation: milestone.maturation_ms,
+            value: AssetBundle(value),
+            status: PayoutStatus::Active,
+        });
+    }
+    Ok(VendorDatum {
+        vendor: MultisigScript::Signature {
+            key_hash: vendor.to_vec(),
+        },
+        payouts,
+    })
+}
+fn datum(params: &FundParams) -> Result<VendorDatum> {
+    project_datum(
+        params
+            .vendor_key_hash
+            .as_deref()
+            .unwrap_or(&params.admin_key_hash),
+        &params.milestones,
+        params.token_policy.as_deref(),
+        params.token_name.as_deref(),
+    )
+}
+
+/// Plan a vendor datum or an ordinary unit-datum treasury deposit without
+/// guessing a fixed ADA floor. Input selection is independent of this sizing.
+pub fn minimum_output_coin(params: &FundParams, treasury_hash: Option<&[u8]>) -> Result<u64> {
+    let datum = datum(params)?;
+    minimum_output_coin_for(
+        treasury_hash.unwrap_or(&params.vendor_script_hash),
+        params.network_id,
+        params.coins_per_utxo_byte,
+        &datum,
+        treasury_hash.is_some(),
+    )
+}
+pub fn minimum_output_coin_for(
+    hash: &[u8],
+    network_id: u8,
+    cost: u64,
+    datum: &VendorDatum,
+    deposit: bool,
+) -> Result<u64> {
+    let value = super::value::Value::from_payouts(&datum.payouts)?;
+    let bytes = if deposit {
+        vec![0xd8, 0x79, 0x80]
+    } else {
+        datum.to_cbor_bytes()
+    };
+    let hash: [u8; 28] = hash
+        .try_into()
+        .context("output script hash must be 28 bytes")?;
+    let address = PallasAddress::from_bytes(&base_script_addr(&hash.into(), network_id).to_vec())?;
+    let assets = value.assets.into_iter().collect::<Vec<_>>();
+    super::fees::minimum_builder_coin(cost, |coin| {
+        super::value::add_assets(
+            Output::new(address.clone(), coin).set_inline_datum(bytes.clone()),
+            &assets,
+        )
+    })
+}
+fn raise_output_minimum(params: &mut FundParams, minimum: u64) -> Result<()> {
+    if minimum > params.vendor_lovelace_total {
+        let extra = minimum - params.vendor_lovelace_total;
+        params.change_lovelace = params
+            .change_lovelace
+            .checked_sub(extra)
+            .context("insufficient ADA for encoded funding output minimum")?;
+        params.vendor_lovelace_total = minimum;
+    }
+    Ok(())
+}
+fn raise_treasury_return_minimum(params: &mut FundParams) -> Result<()> {
+    if let Some(treasury) = &mut params.treasury {
+        if treasury.return_lovelace > 0 || !treasury.return_assets.is_empty() {
+            let address = PallasAddress::from_bech32(&treasury.return_address)?;
+            let assets = treasury
+                .return_assets
+                .iter()
+                .map(|(policy, name, quantity)| {
+                    (
+                        format!("{}{}", hex::encode(policy), hex::encode(name)),
+                        *quantity,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let minimum = super::fees::minimum_builder_coin(params.coins_per_utxo_byte, |coin| {
+                super::value::add_assets(
+                    Output::new(address.clone(), coin).set_inline_datum(vec![0xd8, 0x79, 0x80]),
+                    &assets,
+                )
+            })?;
+            if treasury.return_lovelace < minimum {
+                params.change_lovelace = params
+                    .change_lovelace
+                    .checked_sub(minimum - treasury.return_lovelace)
+                    .context("insufficient ADA for treasury-return minimum")?;
+                treasury.return_lovelace = minimum;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_amounts(params: &FundParams) -> Result<(u64, u64)> {
+    let mut identifiers = std::collections::BTreeSet::new();
+    let mut coin = 0u64;
+    let mut tokens = 0u64;
+    for milestone in &params.milestones {
+        anyhow::ensure!(
+            !milestone.id.trim().is_empty() && identifiers.insert(&milestone.id),
+            "empty or duplicate milestone identifier"
+        );
+        i64::try_from(milestone.lovelace).context("payout ADA exceeds signed datum range")?;
+        i64::try_from(milestone.token_amount).context("payout tokens exceed signed datum range")?;
+        coin = coin
+            .checked_add(milestone.lovelace)
+            .context("payout ADA total overflow")?;
+        tokens = tokens
+            .checked_add(milestone.token_amount)
+            .context("payout token total overflow")?;
+    }
+    anyhow::ensure!(
+        params.vendor_lovelace_total >= coin,
+        "vendor output cannot cover payout ADA"
+    );
+    if tokens > 0 || params.change_tokens > 0 {
+        anyhow::ensure!(
+            params.token_policy.as_ref().is_some_and(|p| p.len() == 28)
+                && params.token_name.as_ref().is_some_and(|n| n.len() <= 32),
+            "invalid or missing payout token identifier"
+        );
+    }
+    let mut asset_ids = std::collections::BTreeSet::new();
+    for (policy, name, qty) in &params.extra_change_assets {
+        anyhow::ensure!(
+            policy.len() == 28 && name.len() <= 32 && *qty > 0,
+            "invalid change asset"
+        );
+        anyhow::ensure!(asset_ids.insert((policy, name)), "duplicate change asset");
+        anyhow::ensure!(
+            params.token_policy.as_ref() != Some(policy)
+                || params.token_name.as_ref() != Some(name),
+            "target token must use the dedicated change quantity"
+        );
+    }
+    let mut inputs = std::collections::BTreeSet::new();
+    let mut input_coin = 0u64;
+    let mut input_tokens = 0u64;
+    for input in &params.inputs {
+        anyhow::ensure!(
+            inputs.insert((input.tx_hash.to_ascii_lowercase(), input.output_index)),
+            "duplicate funding input"
+        );
+        input_coin = input_coin
+            .checked_add(input.lovelace)
+            .context("funding input ADA overflow")?;
+        input_tokens = input_tokens
+            .checked_add(input.token_amount)
+            .context("funding input token overflow")?;
+    }
+    let treasury_coin = params
+        .treasury
+        .as_ref()
+        .map_or(0, |treasury| treasury.return_lovelace);
+    let output_coin = params
+        .vendor_lovelace_total
+        .checked_add(params.change_lovelace)
+        .and_then(|coin| coin.checked_add(params.fee))
+        .and_then(|coin| coin.checked_add(treasury_coin))
+        .context("funding output ADA overflow")?;
+    anyhow::ensure!(input_coin == output_coin, "funding ADA is not conserved");
+    let treasury_tokens = params
+        .treasury
+        .as_ref()
+        .map(|treasury| {
+            treasury
+                .return_assets
+                .iter()
+                .filter(|(policy, name, _)| {
+                    params.token_policy.as_ref() == Some(policy)
+                        && params.token_name.as_ref() == Some(name)
+                })
+                .try_fold(0u64, |total, (_, _, quantity)| {
+                    total
+                        .checked_add(*quantity)
+                        .context("treasury token overflow")
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let output_tokens = tokens
+        .checked_add(params.change_tokens)
+        .and_then(|quantity| quantity.checked_add(treasury_tokens))
+        .context("funding output token overflow")?;
+    anyhow::ensure!(
+        input_tokens == output_tokens,
+        "funding target tokens are not conserved"
+    );
+    Ok((coin, tokens))
 }
 
 pub fn select_ada_treasury_input(
@@ -89,26 +331,35 @@ pub fn select_ada_treasury_input(
 pub fn select_funding_collateral<'a>(
     utxos: &'a [crate::coin_select::WalletUtxo],
     inputs: &[FundInput],
+    minimum: u64,
 ) -> Result<&'a crate::coin_select::WalletUtxo> {
     let excluded: Vec<_> = inputs
         .iter()
         .map(|i| (i.tx_hash.clone(), i.output_index))
         .collect();
-    crate::coin_select::select_separate_collateral(utxos, &excluded)
+    crate::coin_select::select_separate_collateral(utxos, &excluded, minimum)
 }
 
 /// Deposit is an ordinary wallet transfer; it does not create a project.
-pub fn build_deposit(params: FundParams, treasury_hash: &[u8]) -> Result<UnsignedTx> {
+pub fn build_deposit(mut params: FundParams, treasury_hash: &[u8]) -> Result<UnsignedTx> {
+    let minimum = minimum_output_coin(&params, Some(treasury_hash))?;
+    raise_output_minimum(&mut params, minimum)?;
+    let (_, total_tokens) = validate_amounts(&params)?;
     let hash = Hash::<28>::from(<[u8; 28]>::try_from(treasury_hash)?);
     let destination =
         PallasAddress::from_bytes(&base_script_addr(&hash, params.network_id).to_vec())?;
     let mut deposit = Output::new(destination, params.vendor_lovelace_total)
         .set_inline_datum(vec![0xd8, 0x79, 0x80]);
-    if let (Some(policy), Some(name)) = (&params.token_policy, &params.token_name) {
+    if total_tokens > 0 {
+        let policy = params
+            .token_policy
+            .as_ref()
+            .context("missing token policy")?;
+        let name = params.token_name.as_ref().context("missing token name")?;
         deposit = deposit.add_asset(
             Hash::from(<[u8; 28]>::try_from(policy.as_slice())?),
             name.clone(),
-            params.milestones.iter().map(|m| m.token_amount).sum(),
+            total_tokens,
         )?;
     }
     let mut change = Output::new(
@@ -145,6 +396,9 @@ pub fn build_deposit(params: FundParams, treasury_hash: &[u8]) -> Result<Unsigne
         .disclosed_signer(Hash::from(<[u8; 28]>::try_from(
             params.admin_key_hash.as_slice(),
         )?));
+    for key in &params.co_signer_hashes {
+        staging = staging.disclosed_signer(Hash::from(<[u8; 28]>::try_from(key.as_slice())?));
+    }
     if let Some(treasury) = &params.treasury {
         anyhow::ensure!(
             treasury.return_lovelace == 0 && treasury.return_assets.is_empty(),
@@ -202,7 +456,11 @@ pub fn build_deposit(params: FundParams, treasury_hash: &[u8]) -> Result<Unsigne
     ))
 }
 
-pub fn build(params: FundParams) -> Result<UnsignedTx> {
+pub fn build(mut params: FundParams) -> Result<UnsignedTx> {
+    let minimum = minimum_output_coin(&params, None)?;
+    raise_output_minimum(&mut params, minimum)?;
+    raise_treasury_return_minimum(&mut params)?;
+    let (total_coin, total_tokens) = validate_amounts(&params)?;
     // -----------------------------------------------------------------------
     // 1. Vendor address from script hash
     // -----------------------------------------------------------------------
@@ -224,48 +482,12 @@ pub fn build(params: FundParams) -> Result<UnsignedTx> {
     // -----------------------------------------------------------------------
     // 2. Build VendorDatum
     // -----------------------------------------------------------------------
-    let vendor_multisig = MultisigScript::Signature {
-        key_hash: params
-            .vendor_key_hash
-            .clone()
-            .unwrap_or_else(|| params.admin_key_hash.clone()),
-    };
-
-    let payouts: Vec<Payout> = params
-        .milestones
-        .iter()
-        .map(|m| {
-            let mut value: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, i64>> = BTreeMap::new();
-            if m.lovelace > 0 {
-                let mut ada_inner = BTreeMap::new();
-                ada_inner.insert(vec![], m.lovelace as i64);
-                value.insert(vec![], ada_inner);
-            }
-            if m.token_amount > 0 {
-                if let (Some(policy), Some(name)) = (&params.token_policy, &params.token_name) {
-                    let mut token_inner = BTreeMap::new();
-                    token_inner.insert(name.clone(), m.token_amount as i64);
-                    value.insert(policy.clone(), token_inner);
-                }
-            }
-            Payout {
-                maturation: m.maturation_ms,
-                value: AssetBundle(value),
-                status: PayoutStatus::Active,
-            }
-        })
-        .collect();
-
-    let datum = VendorDatum {
-        vendor: vendor_multisig,
-        payouts,
-    };
+    let datum = datum(&params)?;
     let datum_bytes = datum.to_cbor_bytes();
 
     // -----------------------------------------------------------------------
     // 3. Outputs
     // -----------------------------------------------------------------------
-    let total_tokens: u64 = params.milestones.iter().map(|m| m.token_amount).sum();
     let vendor_lovelace = params.vendor_lovelace_total;
 
     let vendor_output = if total_tokens > 0 {
@@ -341,7 +563,7 @@ pub fn build(params: FundParams) -> Result<UnsignedTx> {
 
     if let Some(treasury) = &params.treasury {
         let mut value: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, i64>> = BTreeMap::new();
-        let ada: u64 = params.milestones.iter().map(|m| m.lovelace).sum();
+        let ada = total_coin;
         if ada > 0 {
             value.insert(vec![], BTreeMap::from([(vec![], i64::try_from(ada)?)]));
         }

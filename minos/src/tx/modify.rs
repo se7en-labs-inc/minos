@@ -38,11 +38,14 @@ pub struct ModifyParams {
     pub registry_utxo_index: u64,
     pub vendor_script_ref_hash: String,
     pub vendor_script_ref_index: u64,
-    pub treasury_script_ref_hash: String,
-    pub treasury_script_ref_index: u64,
 
     // Required signers: vendor multisig + modify permission (both are admin key)
     pub admin_key_hash: Vec<u8>,
+    pub vendor_key_hashes: Vec<Vec<u8>>,
+    pub staking_script_hashes: Vec<[u8; 28]>,
+    pub staking_script_refs: Vec<(String, u64)>,
+    pub staking_reward_mem: u64,
+    pub staking_reward_steps: u64,
 
     // Fee wallet
     pub fee_inputs: Vec<WalletUtxo>,
@@ -50,6 +53,7 @@ pub struct ModifyParams {
     pub fee_addr: String,
     pub fee: u64,
     pub change_lovelace: u64,
+    pub coins_per_utxo_byte: u64,
 
     // Validity interval (must be entirely before config.expiration)
     pub valid_from_slot: u64,
@@ -65,6 +69,13 @@ pub struct ModifyParams {
 }
 
 pub fn build(params: ModifyParams) -> Result<UnsignedTx> {
+    let mut wallet_change = params.change_lovelace;
+    anyhow::ensure!(
+        params.staking_script_hashes.len() <= 1,
+        "multiple reward withdrawals are unsupported"
+    );
+    crate::types::VendorDatum::from_cbor_hex(&hex::encode(&params.new_datum_bytes))
+        .context("invalid replacement vendor datum")?;
     // -----------------------------------------------------------------------
     // 1. Addresses
     // -----------------------------------------------------------------------
@@ -83,28 +94,24 @@ pub fn build(params: ModifyParams) -> Result<UnsignedTx> {
     // -----------------------------------------------------------------------
     // 2. Vendor output (same value, corrected datum)
     // -----------------------------------------------------------------------
-    let mut vendor_output = Output::new(vendor_pallas_addr, params.vendor_lovelace)
-        .set_inline_datum(params.new_datum_bytes);
-
-    for (asset_id, qty) in &params.vendor_assets {
-        if asset_id.is_empty() || *qty == 0 {
-            continue;
-        }
-        anyhow::ensure!(asset_id.len() >= 56, "asset_id too short: {asset_id}");
-        let policy_bytes: [u8; 28] = hex::decode(&asset_id[..56])
-            .context("asset policy decode")?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("policy must be 28 bytes"))?;
-        let asset_name = hex::decode(&asset_id[56..]).context("asset name decode")?;
-        vendor_output = vendor_output
-            .add_asset(Hash::from(policy_bytes), asset_name, *qty)
-            .context("add asset to vendor output")?;
-    }
+    let vendor_output = super::fees::funded_output(
+        params.coins_per_utxo_byte,
+        params.vendor_lovelace,
+        &mut wallet_change,
+        |coin| {
+            super::value::add_assets(
+                Output::new(vendor_pallas_addr.clone(), coin)
+                    .set_inline_datum(params.new_datum_bytes.clone()),
+                &params.vendor_assets,
+            )
+        },
+    )?;
 
     // -----------------------------------------------------------------------
     // 3. Change output
     // -----------------------------------------------------------------------
-    let change_output = Output::new(fee_pallas_addr, params.change_lovelace);
+    let change_output =
+        crate::coin_select::change_output(fee_pallas_addr, wallet_change, &params.fee_inputs)?;
 
     // -----------------------------------------------------------------------
     // 4. Parse vendor UTxO input
@@ -129,15 +136,6 @@ pub fn build(params: ModifyParams) -> Result<UnsignedTx> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("vendor script ref hash must be 32 bytes"))?;
     let vendor_ref_input = Input::new(Hash::from(vendor_ref_hash), params.vendor_script_ref_index);
-
-    let treasury_ref_hash: [u8; 32] = hex::decode(&params.treasury_script_ref_hash)
-        .context("treasury script ref hash")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("treasury script ref hash must be 32 bytes"))?;
-    let treasury_ref_input = Input::new(
-        Hash::from(treasury_ref_hash),
-        params.treasury_script_ref_index,
-    );
 
     // -----------------------------------------------------------------------
     // 6. Collateral
@@ -170,7 +168,6 @@ pub fn build(params: ModifyParams) -> Result<UnsignedTx> {
         .input(vendor_input.clone())
         .reference_input(registry_ref_input)
         .reference_input(vendor_ref_input)
-        .reference_input(treasury_ref_input)
         .output(vendor_output)
         .output(change_output)
         .collateral_input(collateral_input)
@@ -187,7 +184,17 @@ pub fn build(params: ModifyParams) -> Result<UnsignedTx> {
                 steps: 800_000_000,
             }),
         )
-        .add_language(ScriptKind::PlutusV3, params.v3_cost_model);
+        .add_language(ScriptKind::PlutusV3, params.v3_cost_model.clone());
+
+    for key in &params.vendor_key_hashes {
+        staging = staging.disclosed_signer(Hash::from(<[u8; 28]>::try_from(key.as_slice())?));
+    }
+    for (hash, index) in &params.staking_script_refs {
+        staging = staging.reference_input(Input::new(
+            Hash::from(<[u8; 32]>::try_from(hex::decode(hash)?.as_slice())?),
+            *index,
+        ));
+    }
 
     for fi in &params.fee_inputs {
         let h: [u8; 32] = hex::decode(&fi.tx_hash)
@@ -205,7 +212,17 @@ pub fn build(params: ModifyParams) -> Result<UnsignedTx> {
         .map_err(|e| anyhow::anyhow!("build_conway_raw: {e}"))?;
 
     let (aux_cbor, aux_hash) = super::metadata::encode_modify(&params.instance_id)?;
-    let final_bytes = cbor_util::add_aux_data(&built.tx_bytes.0, &aux_cbor, &aux_hash)?;
+    let mut final_bytes = cbor_util::add_aux_data(&built.tx_bytes.0, &aux_cbor, &aux_hash)?;
+    for hash in &params.staking_script_hashes {
+        final_bytes = cbor_util::add_treasury_withdrawal(
+            &final_bytes,
+            hash,
+            params.network_id,
+            params.staking_reward_mem,
+            params.staking_reward_steps,
+            &params.v3_cost_model,
+        )?;
+    }
 
     Ok(UnsignedTx::new(
         "modify vendor datum",

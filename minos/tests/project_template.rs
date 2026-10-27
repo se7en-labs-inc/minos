@@ -3,7 +3,7 @@ use serde_json::json;
 
 #[test]
 fn clone_preserves_identity_amounts_and_immediate_first_unlock() {
-    let source = json!({"instanceById":{"project":{"identifier":"CTW-26-0024","label":"Exact project label", "description":"Exact long description", "vendor":{"label":"Se7en Labs"},
+    let source = json!({"instanceById":{"project":{"identifier":"EXAMPLE-001","label":"Exact project label", "description":"Exact long description", "vendor":{"label":"Example Vendor"},
         "milestones":[
             {"identifier":"m-1","label":"Later", "description":"Later desc", "acceptanceCriteria":"Later criteria", "requiresEvidence":true,"contractMilestoneNumber":2,"value":[{"assetId":"source.token","quantity":"987654321"}]},
             {"identifier":"m-0","label":"M0", "description":"", "acceptanceCriteria":"Signed contract", "requiresEvidence":false,"contractMilestoneNumber":1,"value":[{"assetId":"source.token","quantity":"123456789"}]}]}}});
@@ -15,7 +15,7 @@ fn clone_preserves_identity_amounts_and_immediate_first_unlock() {
         Some("0014df105553444d".into()),
     )
     .unwrap();
-    assert_eq!(template.project, "CTW-26-0024");
+    assert_eq!(template.project, "EXAMPLE-001");
     assert_eq!(template.label, "Exact project label");
     assert_eq!(template.description, "Exact long description");
     assert_eq!(template.milestones[0].id, "m-0");
@@ -41,7 +41,7 @@ fn clone_preserves_identity_amounts_and_immediate_first_unlock() {
 
 #[test]
 fn fixed_ada_clone_replaces_all_amounts_but_preserves_metadata_and_schedule() {
-    let source = json!({"instanceById":{"project":{"identifier":"CTW-26-0024","label":"Same name","description":"Same description","vendor":{"label":"Vendor"},"milestones":[
+    let source = json!({"instanceById":{"project":{"identifier":"EXAMPLE-001","label":"Same name","description":"Same description","vendor":{"label":"Vendor"},"milestones":[
         {"identifier":"m-1","contractMilestoneNumber":2,"label":"Later","description":"Later description","acceptanceCriteria":"Later criteria","requiresEvidence":true,"value":[{"assetId":"ada.lovelace","quantity":"1189560"},{"assetId":"source.token","quantity":"999999999999"}]},
         {"identifier":"m-0","contractMilestoneNumber":1,"label":"Initial","description":"Initial description","acceptanceCriteria":"Signed contract","requiresEvidence":false,"value":[{"assetId":"source.token","quantity":"123"}]}]}}});
     let template = minos::project_template::clone_project_ada(&source, 15, 1_000_000, 50).unwrap();

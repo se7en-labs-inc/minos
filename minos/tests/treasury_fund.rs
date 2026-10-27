@@ -39,6 +39,7 @@ fn fixture() -> FundParams {
         extra_change_assets: vec![(vec![4; 28], b"REF".to_vec(), 1)],
         fee_addr: "addr_test1vqe4ud7jajte2glw6mmhe7shmyhtewx0tmf3akesheyy3pcxhpteh".into(),
         fee: 2_000_000,
+        coins_per_utxo_byte: 4310,
         valid_from_slot: 100,
         invalid_from_slot: 200,
         network_id: 0,
@@ -50,7 +51,11 @@ fn distinct_vendor_and_two_admins_are_required_and_preserved_when_signing() {
     let mut params = fixture();
     let mnemonic = bip39::Mnemonic::from_entropy(&[0; 16]).unwrap();
     let keys: Vec<_> = (0..4)
-        .map(|a| minos::wallet::payment_key_hash(&mnemonic, a).to_vec())
+        .map(|a| {
+            minos::wallet::payment_key_hash(&mnemonic, a)
+                .unwrap()
+                .to_vec()
+        })
         .collect();
     params.admin_key_hash = keys[0].clone();
     params.co_signer_hashes = vec![keys[1].clone()];
@@ -59,7 +64,7 @@ fn distinct_vendor_and_two_admins_are_required_and_preserved_when_signing() {
     let mut bytes = hex::decode(built.cbor_hex).unwrap();
     let hash = minos::tx::sign::tx_body_hash(&bytes).unwrap();
     for account in [0, 1, 3] {
-        let (key, signature) = minos::wallet::sign_tx_body(&mnemonic, account, &hash);
+        let (key, signature) = minos::wallet::sign_tx_body(&mnemonic, account, &hash).unwrap();
         bytes = minos::tx::sign::sign_tx(&bytes, &key, &signature)
             .unwrap()
             .0;
@@ -126,6 +131,7 @@ fn existing_deposit_can_be_recreated_with_initialization_metadata_and_reorganize
     params.token_policy = None;
     params.token_name = None;
     params.milestones[0].token_amount = 0;
+    params.inputs[0].token_amount = 0;
     params.extra_change_assets.clear();
     params.treasury = Some(TreasurySpend {
         input: ("55".repeat(32), 0),
@@ -135,6 +141,7 @@ fn existing_deposit_can_be_recreated_with_initialization_metadata_and_reorganize
             output_index: 0,
             lovelace: 10_000_000,
             has_native_assets: false,
+            assets: Default::default(),
         },
         cost_model: vec![0; 297],
         return_address: params.fee_addr.clone(),
@@ -173,6 +180,7 @@ fn funding_spends_treasury_references_registry_and_returns_treasury_surplus() {
             output_index: 0,
             lovelace: 10_000_000,
             has_native_assets: false,
+            assets: Default::default(),
         },
         cost_model: vec![0; 297],
         return_address: params.fee_addr.clone(),
@@ -246,21 +254,23 @@ fn ada_selection_excludes_scripts_assets_and_spent_output_but_allows_sibling_col
             output_index: 0,
             lovelace: 950_000_000,
             has_native_assets: false,
+            assets: Default::default(),
         },
         minos::coin_select::WalletUtxo {
             tx_hash: "ab".repeat(32),
             output_index: 1,
             lovelace: 10_000_000,
             has_native_assets: false,
+            assets: Default::default(),
         },
     ];
     assert_eq!(
-        fund::select_funding_collateral(&wallet, &inputs)
+        fund::select_funding_collateral(&wallet, &inputs, 5_000_000)
             .unwrap()
             .output_index,
         1
     );
-    assert!(fund::select_funding_collateral(&wallet[..1], &inputs).is_err());
+    assert!(fund::select_funding_collateral(&wallet[..1], &inputs, 5_000_000).is_err());
 }
 
 #[test]
@@ -292,6 +302,7 @@ fn nineteen_fifty_ada_payouts_create_no_token_assets_or_treasury_surplus() {
             output_index: 0,
             lovelace: 10_000_000,
             has_native_assets: false,
+            assets: Default::default(),
         },
         cost_model: vec![0; 297],
         return_address: params.fee_addr.clone(),
@@ -324,4 +335,119 @@ fn nineteen_fifty_ada_payouts_create_no_token_assets_or_treasury_surplus() {
             + tx.transaction_body.fee,
         1_000_000_000
     );
+}
+
+#[test]
+fn funding_rejects_lost_value_duplicate_inputs_assets_and_milestone_ids() {
+    let mut lost_coin = fixture();
+    lost_coin.change_lovelace -= 1;
+    assert!(fund::build(lost_coin)
+        .unwrap_err()
+        .to_string()
+        .contains("ADA is not conserved"));
+    let mut lost_token = fixture();
+    lost_token.inputs[0].token_amount += 1;
+    assert!(fund::build(lost_token)
+        .unwrap_err()
+        .to_string()
+        .contains("tokens are not conserved"));
+    let mut duplicate = fixture();
+    duplicate.inputs.push(FundInput {
+        tx_hash: duplicate.inputs[0].tx_hash.clone(),
+        output_index: 0,
+        lovelace: 0,
+        token_amount: 0,
+    });
+    assert!(fund::build(duplicate)
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate funding input"));
+    let mut assets = fixture();
+    assets
+        .extra_change_assets
+        .push(assets.extra_change_assets[0].clone());
+    assert!(fund::build(assets)
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate change asset"));
+    let mut milestones = fixture();
+    milestones.milestones.push(MilestoneSpec {
+        id: "m-0".into(),
+        label: "duplicate".into(),
+        description: None,
+        acceptance_criteria: None,
+        requires_evidence: false,
+        maturation_ms: 0,
+        lovelace: 0,
+        token_amount: 0,
+    });
+    assert!(fund::build(milestones)
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate milestone"));
+}
+
+#[test]
+fn deposit_with_configured_token_but_zero_quantity_has_no_zero_asset_entry() {
+    let mut params = fixture();
+    params.milestones[0].token_amount = 0;
+    params.inputs[0].token_amount = 0;
+    let built = fund::build_deposit(params, &[9; 28]).unwrap();
+    let bytes = hex::decode(built.cbor_hex).unwrap();
+    let tx: Tx<'_> = minicbor::decode(&bytes).unwrap();
+    assert!(MultiEraOutput::from_conway(&tx.transaction_body.outputs[0])
+        .value()
+        .assets()
+        .is_empty());
+}
+
+#[test]
+fn encoded_funding_minimum_handles_large_datums_and_protocol_changes_without_losing_value() {
+    let mut params = fixture();
+    params.coins_per_utxo_byte = 20_000;
+    params.extra_change_assets.clear();
+    params.inputs[0].token_amount = 16;
+    params.milestones = (0..16)
+        .map(|index| MilestoneSpec {
+            id: format!("m-{index}"),
+            label: "Sized payout".into(),
+            description: None,
+            acceptance_criteria: None,
+            requires_evidence: false,
+            maturation_ms: 1_666_656_100_000,
+            lovelace: 1,
+            token_amount: 1,
+        })
+        .collect();
+    let minimum = fund::minimum_output_coin(&params, None).unwrap();
+    assert!(minimum > 10_000_000);
+    let built = fund::build(params.clone()).unwrap();
+    let bytes = hex::decode(built.cbor_hex).unwrap();
+    let tx: Tx<'_> = minicbor::decode(&bytes).unwrap();
+    assert_eq!(
+        MultiEraOutput::from_conway(&tx.transaction_body.outputs[0])
+            .value()
+            .coin(),
+        minimum
+    );
+    assert_eq!(
+        tx.transaction_body
+            .outputs
+            .iter()
+            .map(|output| MultiEraOutput::from_conway(output).value().coin())
+            .sum::<u64>()
+            + tx.transaction_body.fee,
+        1_000_000_000
+    );
+    let actual =
+        minos::preflight::utxo_from_output(&"01".repeat(32), 0, &tx.transaction_body.outputs[0])
+            .unwrap();
+    let native = minos::coin_select::WalletUtxo::try_from(&actual).unwrap();
+    assert_eq!(native.assets.values().copied().sum::<u64>(), 16);
+    params.inputs[0].lovelace = 12_000_000;
+    params.change_lovelace = 0;
+    assert!(fund::build(params)
+        .unwrap_err()
+        .to_string()
+        .contains("insufficient ADA for encoded funding output"));
 }

@@ -1,498 +1,324 @@
-/// Background indexer: polls the node (or Koios) for live UTxOs, and optionally
-/// scans historical transactions via Koios for CIP-100 events.
-use std::sync::Arc;
+//! Supervise dynamically tracked instances. Snapshots report availability only;
+//! confirmed state is produced exclusively by the shared chain reducer.
+use crate::{config::Config, db::Store, koios::Koios, node::PortalNode};
+use anyhow::Result;
+use std::{collections::BTreeMap, sync::Arc};
 use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
-
-use minos::types::VendorDatum;
-use pallas_addresses::{
-    Address as PallasAddr, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
-};
-use pallas_crypto::hash::Hash;
-
-use crate::config::Config;
-use crate::db::{Store, TrackedInstance};
-use crate::koios::Koios;
-use crate::node::{NodeSession, PortalNode};
-use crate::parser;
-use crate::types::{AssetAmount, EventType, Instance, TxOutRef, VendorUtxo};
-
-const REGISTRY_ASSET_NAME: &str = "5245474953545259"; // hex("REGISTRY")
+use tracing::warn;
 
 pub async fn run(
     cfg: Config,
     portal_node: Option<Arc<PortalNode>>,
     koios: Option<Arc<Koios>>,
     store: Arc<Store>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut running = BTreeMap::new();
     loop {
-        let tracked = match store.get_tracked_instances() {
-            Ok(t) => t,
-            Err(e) => {
-                error!("get_tracked_instances: {e}");
-                vec![]
-            }
-        };
-
-        // Open exactly one node connection per poll cycle and reuse it for
-        // all instance queries + the tip update.  This prevents the FD leak
-        // that occurs when every helper opens its own NodeClient.
-        let session_result = if let Some(ref pn) = portal_node {
-            match pn.session().await {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    warn!("tip fetch failed: {e}");
-                    None
+        if *shutdown.borrow() {
+            break;
+        }
+        while let Some(result) = tasks.try_join_next_with_id() {
+            let id = match result {
+                Ok((id, ())) => id,
+                Err(error) => {
+                    warn!("instance task failed: {error}");
+                    error.id()
                 }
-            }
-        } else {
-            None
-        };
-
-        let mut session = session_result;
-
-        for inst_cfg in &tracked {
-            if let Err(e) =
-                index_instance(inst_cfg, session.as_mut(), koios.as_deref(), &store).await
-            {
-                error!("index_instance {}: {e:#}", inst_cfg.id);
-            }
+            };
+            running.retain(|_, task| *task != id);
         }
-
-        // Update chain tip
-        let tip_result: anyhow::Result<(u64, u64)> = if let Some(ref mut s) = session {
-            s.tip().await
-        } else if let Some(ref k) = koios {
-            k.tip().await.map(|t| (t.abs_slot, t.block_height))
-        } else {
-            Ok((0, 0))
-        };
-        match tip_result {
-            Ok((slot, height)) => {
-                let _ = store.set_sync("last_tip_slot", &slot.to_string());
-                let _ = store.set_sync("last_tip_height", &height.to_string());
-            }
-            Err(e) => warn!("tip fetch failed: {e}"),
-        }
-
-        // Close session cleanly — releases the acquire and sends done before
-        // dropping the socket, so the node doesn't see an abrupt disconnect.
-        if let Some(s) = session {
-            s.close().await;
-        }
-
-        sleep(Duration::from_secs(cfg.poll_interval_secs)).await;
-    }
-}
-
-async fn index_instance(
-    inst_cfg: &TrackedInstance,
-    mut session: Option<&mut NodeSession>,
-    koios: Option<&Koios>,
-    store: &Store,
-) -> anyhow::Result<()> {
-    // 1. Locate registry NFT UTxO
-    //    - With node socket: use publish_tx#0 from stored instance record
-    //    - With Koios: query asset UTxOs by policy ID
-    let registry_utxo_opt = if let Some(s) = session.as_deref_mut() {
-        if let Some(inst) = store.get_instance(&inst_cfg.id)? {
-            let outrefs = vec![(inst.publish_tx.clone(), 0u64)];
-            s.outref_utxos(&outrefs).await.ok().and_then(|mut v| {
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.remove(0))
-                }
-            })
-        } else {
-            None
-        }
-    } else if let Some(k) = koios {
-        k.asset_utxos(&inst_cfg.id, REGISTRY_ASSET_NAME)
-            .await
-            .ok()
-            .and_then(|mut v| {
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.remove(0))
-                }
-            })
-    } else {
-        None
-    };
-
-    // 2. Parse registry datum → script hashes
-    let (treasury_hash, vendor_hash) = match registry_utxo_opt
-        .as_ref()
-        .and_then(|u| u.inline_datum.as_deref())
-    {
-        Some(hex) => match parse_script_hash_registry(hex) {
-            Some(pair) => pair,
-            None => {
-                warn!("instance {}: bad ScriptHashRegistry datum", inst_cfg.id);
-                match store.get_instance(&inst_cfg.id)? {
-                    Some(inst) => (inst.treasury_hash, inst.vendor_hash),
-                    None => {
-                        warn!("instance {}: no datum, not in store", inst_cfg.id);
-                        return Ok(());
+        match store.get_tracked_instances() {
+            Ok(instances) => {
+                for instance in instances {
+                    if running.contains_key(&instance.id) {
+                        continue;
                     }
-                }
-            }
-        },
-        None => match store.get_instance(&inst_cfg.id)? {
-            Some(inst) => (inst.treasury_hash, inst.vendor_hash),
-            None => {
-                warn!("instance {}: registry NFT not found", inst_cfg.id);
-                return Ok(());
-            }
-        },
-    };
-
-    // 3. Derive script addresses
-    let network_id = if inst_cfg.network == "mainnet" {
-        1u8
-    } else {
-        0u8
-    };
-    let treasury_addr = script_address_bech32(&treasury_hash, network_id)?;
-    let vendor_addr = script_address_bech32(&vendor_hash, network_id)?;
-
-    // 4. Load or init instance record
-    let publish_tx = registry_utxo_opt
-        .as_ref()
-        .map(|u| u.tx_hash.clone())
-        .or_else(|| {
-            store
-                .get_instance(&inst_cfg.id)
-                .ok()
-                .flatten()
-                .map(|i| i.publish_tx.clone())
-        })
-        .unwrap_or_default();
-
-    let mut instance = store
-        .get_instance(&inst_cfg.id)?
-        .unwrap_or_else(|| Instance {
-            id: inst_cfg.id.clone(),
-            label: String::new(),
-            description: None,
-            expiration_ms: 0,
-            payout_upperbound_ms: 0,
-            vendor_expiration_ms: 0,
-            treasury_hash: treasury_hash.clone(),
-            vendor_hash: vendor_hash.clone(),
-            treasury_ref: None,
-            vendor_ref: None,
-            publish_tx: publish_tx.clone(),
-            network: inst_cfg.network.clone(),
-        });
-
-    // 5. Index publish tx metadata once (only when Koios is available)
-    if !publish_tx.is_empty() && !store.is_indexed(&publish_tx)? {
-        if let Some(k) = koios {
-            let metas = k.tx_metadata(&[publish_tx.as_str()]).await?;
-            if let Some(meta) = metas.first() {
-                if let Some(parsed) = parser::parse_metadata(&publish_tx, 0, 0, &meta.metadata) {
-                    if parsed.event.event_type == EventType::Publish {
-                        apply_publish_metadata(&mut instance, &parsed.event.payload);
-                    }
-                    store.append_event(&parsed.event)?;
-                }
-            }
-            let tx_infos = k.tx_info(&[publish_tx.as_str()]).await?;
-            if let Some(tx_info) = tx_infos.first() {
-                for output in &tx_info.outputs {
-                    if output.payment_addr == treasury_addr && instance.treasury_ref.is_none() {
-                        instance.treasury_ref = Some(TxOutRef {
-                            transaction: publish_tx.clone(),
-                            index: output.tx_index,
-                        });
-                    }
-                    if output.payment_addr == vendor_addr && instance.vendor_ref.is_none() {
-                        instance.vendor_ref = Some(TxOutRef {
-                            transaction: publish_tx.clone(),
-                            index: output.tx_index,
-                        });
-                    }
-                }
-            }
-        }
-        store.mark_indexed(&publish_tx, 0)?;
-    }
-
-    // Set ref UTxOs from publish tx index positions when not already known
-    if instance.treasury_ref.is_none() && !publish_tx.is_empty() {
-        instance.treasury_ref = Some(TxOutRef {
-            transaction: publish_tx.clone(),
-            index: 1,
-        });
-    }
-    if instance.vendor_ref.is_none() && !publish_tx.is_empty() {
-        instance.vendor_ref = Some(TxOutRef {
-            transaction: publish_tx.clone(),
-            index: 2,
-        });
-    }
-
-    instance.treasury_hash = treasury_hash;
-    instance.vendor_hash = vendor_hash;
-    store.upsert_instance(&instance)?;
-
-    // Historical event scanning has been removed — chain-sync (sync.rs) handles
-    // full replay from publish_slot so there is no need to poll Koios for tx history.
-
-    // 6. Refresh live vendor UTxOs (node socket preferred, Koios fallback)
-    let live_utxos = if let Some(s) = session {
-        s.address_utxos(&vendor_addr).await?
-    } else if let Some(k) = koios {
-        k.address_utxos(&vendor_addr).await?
-    } else {
-        vec![]
-    };
-
-    let projects = store.projects_for_instance(&inst_cfg.id)?;
-    for utxo in &live_utxos {
-        let has_vendor_datum = utxo
-            .inline_datum
-            .as_deref()
-            .map(|d| VendorDatum::from_cbor_hex(d).is_ok())
-            .unwrap_or(false);
-        if !has_vendor_datum {
-            continue;
-        }
-        let project_id = match infer_project_id(&projects, utxo) {
-            Some(id) => id,
-            None => {
-                warn!(
-                    "could not infer project for UTxO {}#{}",
-                    utxo.tx_hash, utxo.output_index
-                );
-                continue;
-            }
-        };
-        if let Some(datum_hex) = &utxo.inline_datum {
-            if let Ok(datum) = VendorDatum::from_cbor_hex(datum_hex) {
-                if let Some(mut proj) = store.get_project(&project_id)? {
-                    // Detect newly withdrawn payouts and record events so that
-                    // derive_status() can return Withdrawn for those milestones.
-                    let n_payouts = datum.payouts.len();
-                    let n_milestones = proj.milestones.len();
-                    if n_payouts < n_milestones {
-                        let n_withdrawn = n_milestones - n_payouts;
-                        let already: Vec<String> = store
-                            .withdrawn_milestones_for_project(&project_id)
-                            .unwrap_or_default();
-                        if already.len() < n_withdrawn {
-                            let mut ms_map = serde_json::Map::new();
-                            for i in already.len()..n_withdrawn {
-                                if let Some(ms) = proj.milestones.get(i) {
-                                    ms_map.insert(
-                                        ms.identifier.clone(),
-                                        serde_json::Value::Bool(true),
+                    let id = instance.id.clone();
+                    let store = store.clone();
+                    let koios = koios.clone();
+                    let cfg = cfg.clone();
+                    let mut task_shutdown = shutdown.clone();
+                    let task = tasks.spawn(async move {
+                        if let Some(socket) = cfg.node_socket_path {
+                            crate::sync::run(
+                                instance.id,
+                                socket,
+                                cfg.network_magic,
+                                cfg.node_timeout_secs,
+                                store,
+                                task_shutdown,
+                            )
+                            .await;
+                        } else if let Some(koios) = koios {
+                            loop {
+                                if *task_shutdown.borrow() { break; }
+                                let replay = tokio::select! {
+                                    _ = task_shutdown.changed() => break,
+                                    result = koios.replay(&instance.id, &instance.network, &store) => result,
+                                };
+                                if let Err(error) = replay
+                                {
+                                    warn!(
+                                        "Koios replay {}: {error:#}; retaining committed state",
+                                        instance.id
                                     );
+                                    if let Err(error)=availability(&store,&instance.id,"QueryFailed") { warn!("persist unavailable state: {error:#}"); }
+                                } else {
+                                    if let Err(error)=availability(&store,&instance.id,"Available") { warn!("persist availability: {error:#}"); }
+                                }
+                                tokio::select! {
+                                    _ = task_shutdown.changed() => break,
+                                    _ = sleep(Duration::from_secs(cfg.poll_interval_secs)) => {}
                                 }
                             }
-                            if !ms_map.is_empty() {
-                                let ev = crate::types::Event {
-                                    tx_hash: utxo.tx_hash.clone(),
-                                    block_slot: 0,
-                                    block_height: 0,
-                                    event_type: crate::types::EventType::Withdraw,
-                                    instance_id: inst_cfg.id.clone(),
-                                    project_id: Some(project_id.clone()),
-                                    payload: serde_json::json!({ "milestones": ms_map }),
-                                };
-                                let _ = store.append_event(&ev);
-                            }
                         }
-                    }
-                    sync_maturation(&mut proj, &datum);
-                    store.upsert_project(&proj)?;
+                    });
+                    running.insert(id, task.id());
                 }
             }
+            Err(error) => warn!("load tracked instances: {error:#}"),
         }
-        let mut assets: Vec<AssetAmount> = utxo
-            .assets
-            .iter()
-            .map(|a| AssetAmount {
-                asset_id: format!("{}{}", a.policy_id, a.asset_name),
-                quantity: a.quantity,
-            })
-            .collect();
-        assets.insert(
-            0,
-            AssetAmount {
-                asset_id: String::new(),
-                quantity: utxo.lovelace,
-            },
-        );
-        store.upsert_utxo(&VendorUtxo {
-            tx_hash: utxo.tx_hash.clone(),
-            output_index: utxo.output_index,
-            project_id,
-            address: utxo.address.clone(),
-            datum_hex: utxo.inline_datum.clone().unwrap_or_default(),
-            lovelace: utxo.lovelace,
-            assets,
-            slot: 0,
-        })?;
+        if let Some(node) = &portal_node {
+            let connection = tokio::select! {
+                _ = shutdown.changed() => break,
+                result = node.session() => result,
+            };
+            match connection {
+                Ok(mut session) => {
+                    let observation = tokio::select! {
+                        _ = shutdown.changed() => None,
+                        result = observe(&store, &mut session) => Some(result),
+                    };
+                    session.close().await;
+                    let Some(observation) = observation else {
+                        break;
+                    };
+                    if let Err(error) = observation {
+                        warn!("node snapshot unavailable: {error:#}");
+                        if let Err(error) = unavailable(&store) {
+                            warn!("persist unavailable state: {error:#}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!("node snapshot connection: {error:#}");
+                    if let Err(error) = unavailable(&store) {
+                        warn!("persist unavailable state: {error:#}");
+                    }
+                }
+            }
+        } else if let Some(koios) = &koios {
+            let tip = tokio::select! {
+                _ = shutdown.changed() => break,
+                result = koios.tip() => result,
+            };
+            match tip {
+                Ok(tip) => {
+                    if let Err(error) = store
+                        .set_sync("last_tip_slot", &tip.abs_slot.to_string())
+                        .and_then(|_| {
+                            store.set_sync("last_tip_height", &tip.block_height.to_string())
+                        })
+                    {
+                        warn!("persist tip: {error:#}");
+                    }
+                }
+                Err(error) => warn!("Koios tip: {error:#}"),
+            }
+        }
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = sleep(Duration::from_secs(cfg.poll_interval_secs)) => {}
+        }
     }
-
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            warn!("instance task shutdown: {error}");
+        }
+    }
+}
+fn unavailable(store: &Store) -> Result<()> {
+    for instance in store.get_tracked_instances()? {
+        availability(store, &instance.id, "QueryFailed")?;
+    }
+    Ok(())
+}
+fn availability(store: &Store, instance: &str, status: &str) -> Result<()> {
+    for project in store.projects_for_instance(instance)? {
+        if let Some(output) = store.get_utxo(instance, &project.id)? {
+            store.set_sync(&format!("availability_{}_{}",instance,project.id),&serde_json::json!({"status":status,"tx":output.tx_hash,"index":output.output_index}).to_string())?;
+        }
+    }
+    Ok(())
+}
+async fn observe(store: &Store, session: &mut minos::node::NodeSession) -> Result<()> {
+    let tip = session.tip().await?;
+    let (slot, height) = (tip.abs_slot, tip.block_no);
+    store.set_sync("last_tip_slot", &slot.to_string())?;
+    store.set_sync("last_tip_height", &height.to_string())?;
+    for instance in store.get_tracked_instances()? {
+        for project in store.projects_for_instance(&instance.id)? {
+            if let Some(output) = store.get_utxo(&instance.id, &project.id)? {
+                let refs = vec![(output.tx_hash.clone(), output.output_index)];
+                let result = session.utxo_info(&refs).await;
+                let status = match &result {
+                    Ok(outputs)
+                        if outputs.iter().any(|u| {
+                            u.tx_hash == output.tx_hash && u.tx_index == output.output_index
+                        }) =>
+                    {
+                        "Available"
+                    }
+                    Ok(_) => "Unavailable",
+                    Err(_) => "QueryFailed",
+                };
+                store.set_sync(&format!("availability_{}_{}", instance.id, project.id), &serde_json::json!({"status": status, "slot": slot, "tx": output.tx_hash, "index": output.output_index}).to_string())?;
+                result?;
+            }
+        }
+    }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-pub fn apply_publish_metadata(instance: &mut Instance, body: &serde_json::Value) {
-    if let Some(label) = body.get("label").map(parser::rejoined_string) {
-        instance.label = label;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn shutdown_cancels_a_stalled_supervisor_backend_request() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let observed = started.clone();
+        let app = axum::Router::new().route(
+            "/tip",
+            axum::routing::post(move || {
+                let observed = observed.clone();
+                async move {
+                    observed.notify_one();
+                    std::future::pending::<String>().await
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let cfg: Config =
+            toml::from_str(&format!("koios_url='{url}'\ndevelopment_auth_bypass=true")).unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(run(
+            cfg,
+            None,
+            Some(Arc::new(Koios::new(&url))),
+            Arc::new(Store::temporary()),
+            shutdown_rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+        let _ = server.await;
     }
-    instance.description = body.get("description").map(parser::rejoined_string);
-    instance.expiration_ms = parse_ts(body, "expiration");
-    instance.payout_upperbound_ms = parse_ts(body, "payoutUpperbound");
-    instance.vendor_expiration_ms = parse_ts(body, "vendorExpiration");
-}
 
-fn parse_ts(body: &serde_json::Value, key: &str) -> u64 {
-    body.get(key)
-        .and_then(|v| {
-            v.as_str()
-                .and_then(|s| s.parse().ok())
-                .or_else(|| v.as_u64())
-        })
-        .unwrap_or(0)
-}
-
-async fn enrich_project_from_fund_tx(
-    fund_tx_hash: &str,
-    vendor_addr: &str,
-    proj: &mut crate::types::Project,
-    koios: &Koios,
-) {
-    match koios.tx_info(&[fund_tx_hash]).await {
-        Ok(infos) => {
-            if let Some(tx_info) = infos.first() {
-                for output in &tx_info.outputs {
-                    if output.payment_addr == vendor_addr {
-                        if let Some(datum_hex) = &output.inline_datum {
-                            if let Ok(datum) = VendorDatum::from_cbor_hex(datum_hex) {
-                                sync_maturation(proj, &datum);
-                            }
-                        }
-                        break;
+    #[tokio::test]
+    async fn supervisor_starts_new_instances_retries_errors_and_joins_on_shutdown() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let app = Router::new()
+            .route(
+                "/tip",
+                post(|| async {
+                    Json(serde_json::json!([{"abs_slot":1,"block_no":1,"hash":"01".repeat(32)}]))
+                }),
+            )
+            .route(
+                "/asset_utxos",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        assert_eq!(body["_asset_list"][0][0], "ab".repeat(28));
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!([]))
                     }
-                }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let cfg: Config = toml::from_str(&format!(
+            "koios_url='{url}'\ndevelopment_auth_bypass=true\npoll_interval_secs=1"
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        let store = Arc::new(Store::temporary());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(run(
+            cfg,
+            None,
+            Some(Arc::new(Koios::new(&url))),
+            store.clone(),
+            shutdown_rx,
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        store
+            .register_instance(&"ab".repeat(28), "preview")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while requests.load(Ordering::SeqCst) < 2 {
+                sleep(Duration::from_millis(20)).await;
             }
-        }
-        Err(e) => warn!("tx_info for fund tx {fund_tx_hash}: {e}"),
-    }
-}
-
-pub fn sync_maturation(proj: &mut crate::types::Project, datum: &VendorDatum) {
-    let n_ms = proj.milestones.len();
-    let n_payouts = datum.payouts.len();
-
-    if n_payouts >= n_ms {
-        // Normal case: payouts align with milestones from the start.
-        for (i, payout) in datum.payouts.iter().enumerate() {
-            if let Some(ms) = proj.milestones.get_mut(i) {
-                ms.maturation_ms = payout.maturation;
-            }
-        }
-    } else {
-        // Some payouts were withdrawn. The contract always withdraws the
-        // earliest-matured Active payouts, which correspond to the first
-        // n_withdrawn positions in the sorted milestone list.  Leave those
-        // milestones' maturation_ms untouched and map the remaining payouts
-        // to the milestones that still have on-chain payouts.
-        let n_withdrawn = n_ms - n_payouts;
-        for i in n_withdrawn..n_ms {
-            if let Some(payout) = datum.payouts.get(i - n_withdrawn) {
-                if let Some(ms) = proj.milestones.get_mut(i) {
-                    ms.maturation_ms = payout.maturation;
-                }
-            }
-        }
-    }
-}
-
-fn infer_project_id(
-    projects: &[crate::types::Project],
-    utxo: &crate::koios::Utxo,
-) -> Option<String> {
-    let payout_count = utxo
-        .inline_datum
-        .as_deref()
-        .and_then(|d| VendorDatum::from_cbor_hex(d).ok())
-        .map(|d| d.payouts.len())
-        .unwrap_or(0);
-    infer_project_id_pub(projects, payout_count)
-}
-
-/// Infer project ID from payout count — used by both the poll indexer and the chain sync.
-pub fn infer_project_id_pub(
-    projects: &[crate::types::Project],
-    payout_count: usize,
-) -> Option<String> {
-    if projects.len() == 1 {
-        return Some(projects[0].id.clone());
-    }
-    projects
-        .iter()
-        .find(|p| p.milestones.len() == payout_count)
-        .or_else(|| {
-            projects
-                .iter()
-                .filter(|p| p.milestones.len() >= payout_count)
-                .min_by_key(|p| p.milestones.len() - payout_count)
         })
-        .map(|p| p.id.clone())
-}
-
-pub fn script_address_bech32(hash_hex: &str, network_id: u8) -> anyhow::Result<String> {
-    let bytes: [u8; 28] = hex::decode(hash_hex)
-        .map_err(|e| anyhow::anyhow!("hex: {e}"))?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("script hash not 28 bytes"))?;
-    let hash: Hash<28> = bytes.into();
-    let network = if network_id == 1 {
-        pallas_addresses::Network::Mainnet
-    } else {
-        pallas_addresses::Network::Testnet
-    };
-    let addr = ShelleyAddress::new(
-        network,
-        ShelleyPaymentPart::Script(hash),
-        ShelleyDelegationPart::Script(hash),
-    );
-    PallasAddr::from_bytes(&addr.to_vec())
-        .map_err(|e| anyhow::anyhow!("addr: {e}"))?
-        .to_bech32()
-        .map_err(|e| anyhow::anyhow!("bech32: {e}"))
-}
-
-fn parse_script_hash_registry(datum_hex: &str) -> Option<(String, String)> {
-    let bytes = hex::decode(datum_hex).ok()?;
-    let mut pos = 0;
-    let mut hashes = Vec::new();
-    while pos + 2 < bytes.len() && hashes.len() < 2 {
-        if bytes[pos] == 0x58 && bytes[pos + 1] == 0x1c {
-            let start = pos + 2;
-            let end = start + 28;
-            if end <= bytes.len() {
-                hashes.push(hex::encode(&bytes[start..end]));
-                pos = end;
-                continue;
-            }
-        }
-        pos += 1;
+        .await
+        .unwrap();
+        assert!(store.checkpoint(&"ab".repeat(28)).unwrap().is_none());
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+        let _ = server.await;
     }
-    if hashes.len() == 2 {
-        Some((hashes[0].clone(), hashes[1].clone()))
-    } else {
-        None
+
+    #[tokio::test]
+    async fn failed_queries_hide_stale_outputs_without_inventing_withdrawals() {
+        let (instance, blocks) = crate::chain::tests::lifecycle_fixture();
+        let store = Arc::new(Store::temporary());
+        store.register_instance(&instance, "preview").unwrap();
+        for block in blocks {
+            store.commit_block(&instance, &block).unwrap();
+        }
+        let before = serde_json::to_value(store.projection(&instance).unwrap()).unwrap();
+        availability(&store, &instance, "QueryFailed").unwrap();
+        let cfg: Config =
+            toml::from_str("koios_url='http://127.0.0.1:1'\ndevelopment_auth_bypass=true").unwrap();
+        let schema = crate::schema::build(store.clone(), None, None, cfg);
+        let query=format!("{{ instanceById(ID: \"{instance}\") {{ confirmed projects {{ identifier availability unspentOutput {{ transaction }} milestones {{ identifier status }} }} }} }}");
+        let response = schema.execute(&query).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        let project = &data["instanceById"]["projects"][0];
+        assert!(project["unspentOutput"].is_null());
+        assert_eq!(project["availability"], "Unavailable");
+        assert_eq!(project["milestones"][0]["status"], "Unavailable");
+        assert_eq!(project["milestones"][1]["status"], "Withdrawn");
+        assert_eq!(
+            serde_json::to_value(store.projection(&instance).unwrap()).unwrap(),
+            before
+        );
+        availability(&store, &instance, "Available").unwrap();
+        let recovered = schema.execute(&query).await.data.into_json().unwrap();
+        assert!(!recovered["instanceById"]["projects"][0]["unspentOutput"].is_null());
     }
 }

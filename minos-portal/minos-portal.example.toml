@@ -1,0 +1,27 @@
+port = 8080
+bind_address = "127.0.0.1"
+db_path = "minos-portal.db"
+poll_interval_secs = 20
+
+# Use a local cardano-node socket for history replay/follow, tip and UTxO queries.
+node_socket_path = "/path/to/cardano-node.socket"
+network_magic = 2                                 # 2=preview, 1=preprod, 764824073=mainnet
+node_timeout_secs = 30
+
+# Koios supplies full history replay when no node socket is configured.
+# In mixed mode node history is authoritative; Koios also enables the
+# indexTransaction mutation's transaction lookup. Node-only mode needs no Koios.
+# koios_url = "https://preview.koios.rest/api/v1"
+
+# Key hashes whose valid witnesses authorize transaction registration.
+# registerTransaction and its newTransaction alias never submit to the chain.
+# indexTransaction checks fetched CBOR/hash/authorship and queues chain replay.
+# Empty authors are rejected unless development_auth_bypass is explicitly enabled.
+# Development bypass requires a loopback bind address. Never expose it through a proxy.
+# development_auth_bypass = true
+allowed_authors = ["REPLACE_WITH_AUTHORIZED_KEY_HASH"]
+
+# Instances listed here are registered on startup (idempotent).
+# [[instances]]
+# id = "<oneshot_policy_id>"
+# network = "preview"

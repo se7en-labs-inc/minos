@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "target": "x86_64-linux",
+  "offlineGates": {
+    "workspaceRustTests": { "passed": 146, "failed": 0, "portalTests": 33 },
+    "elmTests": { "passed": 14, "failed": 0 },
+    "strictAllTargetClippy": "passed",
+    "rustFormatting": "passed",
+    "treefmt": "passed",
+    "cleanCommittedCandidatePackages": "passed",
+    "cleanCommittedCandidateFlakeChecks": "passed",
+    "installedRuntimeWithoutDevLibraryPath": "passed",
+    "installedNoticeChecksums": "passed"
+  },
+  "artifacts": {
+    "minos": "/nix/store/gzk01wf3mhhshb2s0ql36y70z05rpj04-minos-0.1.0",
+    "minosUi": "/nix/store/xyrxd33p8psl1i2daajlj9b8zrg9r55q-minos-ui-0.1.0"
+  },
+  "dependencyAudit": {
+    "tlsTokioAndYankedFindings": "patched",
+    "remainingVulnerabilityEntries": 7,
+    "remainingIds": ["RUSTSEC-2026-0387", "RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369"],
+    "remainingWarnings": ["fxhash", "instant", "paste"],
+    "unfilteredCargoAudit": "nonzero; documented Linux/input-scope exclusions accepted by maintainer",
+    "suppressionsAdded": false
+  },
+  "notices": { "rustCrates": 383, "rustLicenseTexts": 111, "elmPackages": 10, "duckdbThirdPartyLicenseFiles": 28 },
+  "history": { "originalRefs": "backed up privately for authorized sanitized master integration", "sanitizedCandidate": "master integration", "contextFile": "ignored locally and removed from every reachable commit", "secretsDetected": 0, "authorEmailAttribution": "preserved" },
+  "livePreview": "deferred by maintainer for master integration; empty API-v2 portal verified; integrated lifecycle evidence still required before release acceptance",
+  "publication": "not performed or authorized"
+}

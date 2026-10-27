@@ -1,0 +1,353 @@
+//! modify command workflow, independent of CLI argument parsing.
+use super::*;
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn cmd_modify(
+    portal: &Portal,
+    koios: &DataSource,
+    script_references: &[references::ScriptReference],
+    vendor_signers: &[Vec<u8>],
+    instance: &str,
+    project: &str,
+    admin_key_hex: &str,
+    fee_addr: &str,
+    publish_tx: Option<&str>,
+    vendor_utxo_override: Option<&str>,
+    milestones_path: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+    network_id: u8,
+    genesis_offset_secs: u64,
+) -> Result<()> {
+    let admin_key_hash = hex::decode(admin_key_hex.trim()).context("admin_key hex")?;
+    anyhow::ensure!(admin_key_hash.len() == 28, "admin_key must be 28 bytes");
+
+    // -------------------------------------------------------------------------
+    // Resolve vendor UTxO (portal or Koios fallback)
+    // -------------------------------------------------------------------------
+    struct VendorInfo {
+        utxo_hash: String,
+        utxo_index: u64,
+        address: String,
+        datum_hex: String,
+        lovelace: u64,
+        assets: Vec<(String, u64)>,
+    }
+
+    let vendor_info: VendorInfo = if let Some(override_ref) = vendor_utxo_override {
+        let (hash, idx) = parse_utxo_ref(override_ref)?;
+        let utxo_list = koios.utxo_info(&[(hash.clone(), idx)]).await?;
+        anyhow::ensure!(
+            utxo_list.len() == 1,
+            "expected exactly one vendor output response"
+        );
+        let utxo = utxo_list
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("vendor UTxO {hash}#{idx} not found on chain"))?;
+        let datum_hex = utxo
+            .datum_hex()
+            .ok_or_else(|| anyhow::anyhow!("vendor UTxO has no inline datum"))?;
+        anyhow::ensure!(
+            utxo.tx_hash == hash && utxo.tx_index == idx,
+            "vendor output response mismatch"
+        );
+        let checked = coin_select::WalletUtxo::try_from(&utxo)?;
+        let lovelace = checked.lovelace;
+        let assets: Vec<(String, u64)> = checked.assets.into_iter().collect();
+        VendorInfo {
+            utxo_hash: utxo.tx_hash,
+            utxo_index: utxo.tx_index,
+            address: utxo.address,
+            datum_hex,
+            lovelace,
+            assets,
+        }
+    } else {
+        let inst = portal.instance_by_id(instance).await?;
+        let proj = inst
+            .projects
+            .iter()
+            .find(|p| p.identifier == project)
+            .ok_or_else(|| anyhow::anyhow!("project '{project}' not found"))?;
+        let output = proj
+            .unspent_output
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("project '{project}' has no unspent UTxO"))?;
+        let lovelace = output
+            .value
+            .iter()
+            .find(|v| v.asset_id.is_empty())
+            .map(|v| v.quantity)
+            .unwrap_or(0);
+        let assets: Vec<(String, u64)> = output
+            .value
+            .iter()
+            .filter(|v| !v.asset_id.is_empty())
+            .map(|v| (v.asset_id.clone(), v.quantity))
+            .collect();
+        VendorInfo {
+            utxo_hash: output.transaction.clone(),
+            utxo_index: output.index,
+            address: output.address.clone(),
+            datum_hex: output.datum_hex.clone(),
+            lovelace,
+            assets,
+        }
+    };
+
+    // -------------------------------------------------------------------------
+    // Resolve registry / script reference UTxOs
+    // -------------------------------------------------------------------------
+    let hints = if let Some(publish) = publish_tx {
+        references::ReferenceHints {
+            legacy_publish_tx: Some(publish.into()),
+            ..Default::default()
+        }
+    } else {
+        let instance = portal.instance_by_id(instance).await?;
+        references::ReferenceHints {
+            registry: instance
+                .registry
+                .registry_reference
+                .as_ref()
+                .map(|reference| (reference.transaction.clone(), reference.index)),
+            vendor: instance
+                .registry
+                .vendor_script
+                .script_reference
+                .as_ref()
+                .map(|reference| (reference.transaction.clone(), reference.index)),
+            legacy_publish_tx: None,
+        }
+    };
+
+    // 2. Decode current datum
+    let datum = types::VendorDatum::from_cbor_hex(&vendor_info.datum_hex)?;
+    let vendor_key_hashes = if vendor_signers.is_empty() {
+        datum.vendor.key_hashes()
+    } else {
+        vendor_signers.to_vec()
+    };
+    let (staking_script_hashes, staking_script_refs) =
+        references::staking_authorization(&datum.vendor, script_references)?;
+    let staking_expected = staking_script_refs
+        .iter()
+        .cloned()
+        .zip(staking_script_hashes.iter().map(hex::encode))
+        .collect::<Vec<_>>();
+    let ref_info =
+        references::vendor_inputs(koios, instance, hints, script_references, &staking_expected)
+            .await?;
+
+    // 3. Build corrected datum.
+    let corrected_payouts: Vec<types::Payout> = if let Some(ms_path) = milestones_path {
+        // Replace payouts wholesale from milestones JSON.
+        // Infer token policy+name from the first non-empty payout in the existing datum.
+        let milestone_specs: Vec<minos::project_template::Milestone> =
+            serde_json::from_str(&std::fs::read_to_string(ms_path)?).context("milestones JSON")?;
+        anyhow::ensure!(!milestone_specs.is_empty(), "milestones list is empty");
+
+        // Find (policy_bytes, name_bytes) from existing datum (skip the b"" zero-ADA policy).
+        let token_info: Option<(Vec<u8>, Vec<u8>)> = datum.payouts.iter().find_map(|p| {
+            p.value.0.iter().find_map(|(policy, assets)| {
+                if policy.is_empty() {
+                    return None;
+                }
+                assets.iter().find_map(|(name, &qty)| {
+                    if qty != 0 {
+                        Some((policy.clone(), name.clone()))
+                    } else {
+                        None
+                    }
+                })
+            })
+        });
+        let (token_policy, token_name) = token_info.ok_or_else(|| {
+            anyhow::anyhow!("could not infer token policy/name from existing datum")
+        })?;
+
+        milestone_specs
+            .into_iter()
+            .map(|m| {
+                let mut inner: std::collections::BTreeMap<
+                    Vec<u8>,
+                    std::collections::BTreeMap<Vec<u8>, i64>,
+                > = std::collections::BTreeMap::new();
+                if m.token_amount > 0 {
+                    inner
+                        .entry(token_policy.clone())
+                        .or_default()
+                        .insert(token_name.clone(), m.token_amount as i64);
+                }
+                if m.lovelace > 0 {
+                    inner
+                        .entry(vec![])
+                        .or_default()
+                        .insert(vec![], m.lovelace as i64);
+                }
+                types::Payout {
+                    maturation: m.maturation_ms,
+                    value: types::AssetBundle(inner),
+                    status: types::PayoutStatus::Active,
+                }
+            })
+            .collect()
+    } else {
+        // Strip zero-quantity entries and reset statuses to Active.
+        datum
+            .payouts
+            .iter()
+            .map(|p| {
+                let cleaned_inner: std::collections::BTreeMap<
+                    Vec<u8>,
+                    std::collections::BTreeMap<Vec<u8>, i64>,
+                > = p
+                    .value
+                    .0
+                    .iter()
+                    .filter_map(|(policy, assets)| {
+                        let non_zero: std::collections::BTreeMap<Vec<u8>, i64> = assets
+                            .iter()
+                            .filter(|(_, &qty)| qty != 0)
+                            .map(|(k, &v)| (k.clone(), v))
+                            .collect();
+                        if non_zero.is_empty() {
+                            None
+                        } else {
+                            Some((policy.clone(), non_zero))
+                        }
+                    })
+                    .collect();
+                types::Payout {
+                    maturation: p.maturation,
+                    value: types::AssetBundle(cleaned_inner),
+                    status: types::PayoutStatus::Active,
+                }
+            })
+            .collect()
+    };
+
+    let new_datum = types::VendorDatum {
+        vendor: datum.vendor.clone(),
+        payouts: corrected_payouts,
+    };
+    let new_datum_bytes = new_datum.to_cbor_bytes();
+
+    if milestones_path.is_some() {
+        eprintln!(
+            "New datum: {} payouts from milestones JSON, all Active",
+            new_datum.payouts.len()
+        );
+    } else {
+        eprintln!(
+            "Corrected datum: {} payouts, all Active, zero-qty entries stripped",
+            new_datum.payouts.len()
+        );
+    }
+
+    // 4. Fetch tip and wallet UTxOs
+    let tip = koios.tip().await?;
+    let valid_from_slot = tip.abs_slot.saturating_sub(120);
+    let invalid_from_slot = tip.abs_slot + 7200;
+
+    let utxos = koios.address_utxos(fee_addr).await?;
+    let wallet_utxos: Vec<coin_select::WalletUtxo> = utxos
+        .iter()
+        .map(coin_select::WalletUtxo::try_from)
+        .collect::<Result<Vec<_>>>()?;
+    let proto = koios.protocol_params().await?;
+    let v3_cost_model = proto
+        .v3_cost_model()
+        .ok_or_else(|| anyhow::anyhow!("no PlutusV3 cost model"))?;
+
+    let ref_utxos = ref_info.inputs;
+    let ref_script_bytes = references::total_script_bytes(&ref_utxos)?;
+    let fee_reserve = tx::fees::maximum_fee(&proto, ref_script_bytes, true)?;
+    let output_minimum = tx::fees::minimum_value_coin(
+        &vendor_info.address,
+        tx::fees::utxo_cost(&proto)?,
+        &vendor_info.assets,
+        Some(&new_datum_bytes.clone()),
+    )?;
+    let (selected, total_selected) = coin_select::select_with_change(
+        &wallet_utxos,
+        fee_addr,
+        tx::fees::utxo_cost(&proto)?,
+        fee_reserve,
+        output_minimum.saturating_sub(vendor_info.lovelace),
+    )?;
+    let fee_refs: Vec<_> = selected
+        .iter()
+        .map(|u| (u.tx_hash.clone(), u.output_index))
+        .collect();
+    let collateral = coin_select::select_separate_collateral(&wallet_utxos, &fee_refs, 0)?;
+
+    let mut params = tx::modify::ModifyParams {
+        coins_per_utxo_byte: tx::fees::utxo_cost(&proto)?,
+        vendor_utxo_hash: vendor_info.utxo_hash,
+        vendor_utxo_index: vendor_info.utxo_index,
+        vendor_address: vendor_info.address,
+        new_datum_bytes,
+        vendor_lovelace: vendor_info.lovelace,
+        vendor_assets: vendor_info.assets,
+        registry_utxo_hash: ref_info.registry.0,
+        registry_utxo_index: ref_info.registry.1,
+        vendor_script_ref_hash: ref_info.vendor.0,
+        vendor_script_ref_index: ref_info.vendor.1,
+        admin_key_hash,
+        vendor_key_hashes,
+        staking_script_hashes,
+        staking_script_refs,
+        staking_reward_mem: 2_500_000,
+        staking_reward_steps: 900_000_000,
+        fee_inputs: selected.iter().map(|u| (*u).clone()).collect(),
+        collateral: collateral.clone(),
+        fee_addr: fee_addr.to_string(),
+        fee: fee_reserve,
+        change_lovelace: total_selected.saturating_sub(fee_reserve),
+        valid_from_slot,
+        invalid_from_slot,
+        v3_cost_model,
+        instance_id: instance.to_string(),
+        network_id,
+    };
+
+    let witnesses = tx::fees::witness_count(
+        params
+            .vendor_key_hashes
+            .iter()
+            .chain(std::iter::once(&params.admin_key_hash))
+            .map(Vec::as_slice),
+        fee_addr,
+        network_id,
+    )?;
+    let unsigned_tx = tx::fees::balance(
+        &proto,
+        total_selected,
+        ref_script_bytes,
+        witnesses,
+        |fee, change| {
+            params.collateral = coin_select::select_separate_collateral(
+                &wallet_utxos,
+                &fee_refs,
+                tx::fees::minimum_collateral(fee, &proto)?,
+            )?
+            .clone();
+            params.fee = fee;
+            params.change_lovelace = change;
+            tx::modify::build(params.clone())
+        },
+    )?;
+    tx::fees::validate_collateral(&unsigned_tx.cbor_hex, &proto, &params.collateral)?;
+    minos::preflight::transaction(
+        koios,
+        &unsigned_tx.cbor_hex,
+        &proto,
+        genesis_offset_secs,
+        &ref_utxos,
+    )
+    .await?;
+    eprintln!("tx fee: {:.4} ADA", params.fee as f64 / 1_000_000.0);
+
+    write_tx(unsigned_tx, out)
+}

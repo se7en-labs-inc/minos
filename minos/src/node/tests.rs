@@ -148,8 +148,10 @@ fn pparams() -> q::ProtocolParam {
     p.minfee_a = Some(44);
     p.minfee_b = Some(155381);
     p.max_transaction_size = Some(16384);
+    p.max_value_size = Some(5000);
     p.collateral_percentage = Some(150);
     p.max_collateral_inputs = Some(3);
+    p.ada_per_utxo_byte = Some(AnyUInt::U16(4310));
     p.protocol_version = Some((10, 0));
     p.max_tx_ex_units = Some(q::ExUnits {
         mem: 14_000_000,

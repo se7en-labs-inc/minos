@@ -32,7 +32,10 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Async runtime + HTTP
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = [
+  "json",
+  "rustls-tls",
+], default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -51,3 +54,6 @@ docx-rs = "0.4"
 
 # Flat UPLC encoding for applyParamsToScript
 uplc = "1.1"
+
+[dev-dependencies]
+zip = { version = "8.6", default-features = false, features = ["deflate"] }

@@ -8,7 +8,7 @@ description = "TOM Portal: chain indexer + GraphQL API for Cardano treasury over
 [dependencies]
 # Web server
 axum = { version = "0.7", features = ["macros"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "limit", "timeout"] }
 
 # GraphQL
 async-graphql = { version = "7", features = ["chrono"] }
@@ -25,11 +25,15 @@ pallas-traverse = "1.4.0"
 
 # Storage
 sled = "0.34"
-duckdb = { version = "1", features = ["bundled"] }
+# The events table uses JSON; include its extension for offline/clean deployments.
+duckdb = { version = "1", features = ["bundled", "json"] }
 
 # Async runtime + HTTP
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = [
+  "json",
+  "rustls-tls",
+], default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -45,3 +49,6 @@ chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+pallas-txbuilder = "1.4.0"

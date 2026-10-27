@@ -376,8 +376,7 @@ fn protocol_params(p: q::ProtocolParam) -> Result<ProtocolParams> {
         ref_price.denominator != 0,
         "reference script price has zero denominator"
     );
-    // The existing fee API uses integer lovelace/byte. Round up fractional prices.
-    let ref_price = ref_price.numerator.div_ceil(ref_price.denominator);
+    let rounded_ref_price = ref_price.numerator.div_ceil(ref_price.denominator);
     Ok(ProtocolParams::from_fields(
         p.minfee_a.context("missing minfee_a")?,
         p.minfee_b.context("missing minfee_b")?,
@@ -390,9 +389,16 @@ fn protocol_params(p: q::ProtocolParam) -> Result<ProtocolParams> {
         Some(serde_json::json!({ "PlutusV3": v3 })),
         rational(&prices.mem_price)?,
         rational(&prices.step_price)?,
-        ref_price,
+        rounded_ref_price,
     )
-    .with_evaluation_limits(major, max_ex.mem, max_ex.steps))
+    .with_ledger_fields(
+        uint(&p.ada_per_utxo_byte.context("missing coins per UTxO byte")?),
+        (prices.mem_price.numerator, prices.mem_price.denominator),
+        (prices.step_price.numerator, prices.step_price.denominator),
+        (ref_price.numerator, ref_price.denominator),
+    )
+    .with_evaluation_limits(major, max_ex.mem, max_ex.steps)
+    .with_max_value_size(p.max_value_size.context("missing maximum value size")?))
 }
 
 fn uint(n: &AnyUInt) -> u64 {

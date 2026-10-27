@@ -1,8 +1,11 @@
 pub mod airgap;
+pub mod cbor;
 pub mod coin_select;
 pub mod cose;
 pub mod evidence;
+pub mod http;
 pub mod koios;
+pub mod metadata;
 pub mod node;
 pub mod portal;
 pub mod preflight;

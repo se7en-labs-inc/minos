@@ -20,7 +20,7 @@ fn additional_issuance_keeps_policy_and_does_not_duplicate_reference_nft() {
             dest_addr: "addr_test1vqe4ud7jajte2glw6mmhe7shmyhtewx0tmf3akesheyy3pcxhpteh".into(),
             fee_addr: "addr_test1vqe4ud7jajte2glw6mmhe7shmyhtewx0tmf3akesheyy3pcxhpteh".into(),
             fee: 1_000_000,
-            change_lovelace: 16_000_000,
+            coins_per_utxo_byte: 4310,
             valid_from_slot: 100,
             invalid_from_slot: 200,
             network_id: 0,

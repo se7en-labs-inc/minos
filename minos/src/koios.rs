@@ -13,8 +13,7 @@ pub struct Koios {
 impl Koios {
     pub fn new(base_url: &str, api_key: Option<String>) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+            client: crate::http::client_builder()
                 .build()
                 .expect("HTTP client configuration"),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -41,25 +40,19 @@ impl Koios {
     }
 
     pub async fn tip(&self) -> Result<Tip> {
-        let resp: Vec<Tip> = self
-            .request("/tip")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+        let resp: Vec<Tip> = crate::http::json(self.request("/tip").send().await?)
             .await
             .context("tip parse")?;
         resp.into_iter().next().context("empty tip response")
     }
 
     pub async fn protocol_params(&self) -> Result<ProtocolParams> {
-        let resp: Vec<ProtocolParams> = self
+        let response = self
             .request("/epoch_params")
             .query(&[("limit", "1"), ("order", "epoch_no.desc")])
             .send()
-            .await?
-            .error_for_status()?
-            .json()
+            .await?;
+        let resp: Vec<ProtocolParams> = crate::http::json(response)
             .await
             .context("protocol_params parse")?;
         resp.into_iter()
@@ -68,33 +61,27 @@ impl Koios {
     }
 
     pub async fn asset_utxos(&self, policy_id: &str, asset_name: &str) -> Result<Vec<Utxo>> {
-        let asset_list = format!("{policy_id}{asset_name}");
-        let resp: Vec<Utxo> = self
+        let response = self
             .post_request("/asset_utxos")
             .json(
                 &serde_json::json!({ "_asset_list": [[policy_id, asset_name]], "_extended": true }),
             )
             .send()
-            .await?
-            .error_for_status()?
-            .json()
+            .await?;
+        crate::http::json(response)
             .await
-            .context("asset_utxos parse")?;
-        let _ = asset_list; // suppress unused warning
-        Ok(resp)
+            .context("asset_utxos parse")
     }
 
     pub async fn address_utxos(&self, address: &str) -> Result<Vec<Utxo>> {
-        let resp: Vec<Utxo> = self
+        let response = self
             .post_request("/address_utxos")
             .json(&serde_json::json!({ "_addresses": [address], "_extended": true }))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
+            .await?;
+        crate::http::json(response)
             .await
-            .context("address_utxos parse")?;
-        Ok(resp)
+            .context("address_utxos parse")
     }
 
     /// Fetch UTxO details for specific (tx_hash, output_index) pairs.
@@ -104,27 +91,22 @@ impl Koios {
             .iter()
             .map(|(hash, idx)| format!("{}#{}", hash, idx))
             .collect();
-        let resp: Vec<Utxo> = self
+        let response = self
             .post_request("/utxo_info")
             .json(&serde_json::json!({ "_utxo_refs": refs, "_extended": true }))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("utxo_info parse")?;
-        Ok(resp)
+            .await?;
+        crate::http::json(response).await.context("utxo_info parse")
     }
 
     /// Fetch the ledger CBOR of a confirmed transaction.
     pub async fn transaction_cbor(&self, hash: &str) -> Result<String> {
-        let rows: Vec<serde_json::Value> = self
+        let response = self
             .post_request("/tx_cbor")
             .json(&serde_json::json!({"_tx_hashes":[hash]}))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
+            .await?;
+        let rows: Vec<serde_json::Value> = crate::http::json(response)
             .await
             .context("transaction CBOR response")?;
         anyhow::ensure!(rows.len() == 1, "expected one confirmed transaction");
@@ -148,7 +130,8 @@ impl Koios {
             .await
             .context("submittx request")?;
         let status = resp.status();
-        let body = resp.text().await?;
+        let body = String::from_utf8(crate::http::body_bytes(resp).await?)
+            .context("invalid submit response UTF-8")?;
         if !status.is_success() {
             anyhow::bail!("submittx failed ({status}): {body}");
         }
@@ -184,6 +167,43 @@ pub struct ProtocolParams {
 }
 
 impl ProtocolParams {
+    pub fn parameter(&self, name: &str) -> &serde_json::Value {
+        &self._extra[name]
+    }
+
+    pub fn with_max_value_size(mut self, bytes: u64) -> Self {
+        self._extra["max_val_size"] = bytes.into();
+        self
+    }
+
+    pub fn max_value_size(&self) -> Result<u64> {
+        let value = &self._extra["max_val_size"];
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+            .filter(|value| *value > 0)
+            .context("missing or invalid maximum value size")
+    }
+
+    pub fn with_ledger_fields(
+        mut self,
+        coins_per_byte: u64,
+        memory: (u64, u64),
+        steps: (u64, u64),
+        reference: (u64, u64),
+    ) -> Self {
+        self._extra["coins_per_utxo_size"] = coins_per_byte.into();
+        for (name, (numerator, denominator)) in [
+            ("price_mem", memory),
+            ("price_step", steps),
+            ("min_fee_ref_script_cost_per_byte", reference),
+        ] {
+            self._extra[format!("exact_{name}")] =
+                serde_json::json!({"numerator": numerator, "denominator": denominator});
+        }
+        self
+    }
+
     pub fn evaluation_limits(&self) -> Result<(u16, u64, u64)> {
         let integer = |name: &str| {
             self._extra[name]
@@ -293,7 +313,7 @@ impl ProtocolParams {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, serde::Serialize, Clone)]
 pub struct Utxo {
     pub tx_hash: String,
     pub tx_index: u64,
@@ -306,7 +326,7 @@ pub struct Utxo {
     pub reference_script: Option<serde_json::Value>,
     pub datum_hash: Option<String>,
     /// Ledger output retained by the node adapter for evaluation.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_cbor: Option<Vec<u8>>,
 }
 

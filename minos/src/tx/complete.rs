@@ -64,6 +64,7 @@ pub struct CompleteParams {
     pub fee_addr: String, // bech32 change address
     pub fee: u64,
     pub change_lovelace: u64,
+    pub coins_per_utxo_byte: u64,
 
     // Validity interval
     pub valid_from_slot: u64,
@@ -85,6 +86,11 @@ pub struct CompleteParams {
 }
 
 pub fn build(params: CompleteParams) -> Result<UnsignedTx> {
+    let mut wallet_change = params.change_lovelace;
+    anyhow::ensure!(
+        params.staking_script_hashes.len() <= 1,
+        "multiple reward withdrawals are unsupported"
+    );
     // -----------------------------------------------------------------------
     // 1. Encode CIP-100 metadata and compute hash
     // -----------------------------------------------------------------------
@@ -155,28 +161,23 @@ pub fn build(params: CompleteParams) -> Result<UnsignedTx> {
     // -----------------------------------------------------------------------
     let datum_bytes = hex::decode(&params.vendor_datum_hex).context("vendor datum hex decode")?;
 
-    let mut vendor_output =
-        Output::new(vendor_addr, params.vendor_value_lovelace).set_inline_datum(datum_bytes);
-
-    for (asset_id, qty) in &params.vendor_value_assets {
-        if asset_id.is_empty() {
-            continue; // lovelace already handled
-        }
-        anyhow::ensure!(asset_id.len() >= 56, "asset_id too short: {asset_id}");
-        let policy_bytes: [u8; 28] = hex::decode(&asset_id[..56])
-            .context("asset policy_id decode")?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("policy_id must be 28 bytes"))?;
-        let asset_name = hex::decode(&asset_id[56..]).context("asset name decode")?;
-        vendor_output = vendor_output
-            .add_asset(Hash::from(policy_bytes), asset_name, *qty)
-            .context("add_asset on vendor output")?;
-    }
+    let vendor_output = super::fees::funded_output(
+        params.coins_per_utxo_byte,
+        params.vendor_value_lovelace,
+        &mut wallet_change,
+        |coin| {
+            super::value::add_assets(
+                Output::new(vendor_addr.clone(), coin).set_inline_datum(datum_bytes.clone()),
+                &params.vendor_value_assets,
+            )
+        },
+    )?;
 
     // -----------------------------------------------------------------------
     // 6. Build change output
     // -----------------------------------------------------------------------
-    let change_output = Output::new(fee_addr, params.change_lovelace);
+    let change_output =
+        crate::coin_select::change_output(fee_addr, wallet_change, &params.fee_inputs)?;
 
     // -----------------------------------------------------------------------
     // 7. Parse collateral

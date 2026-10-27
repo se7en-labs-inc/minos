@@ -259,7 +259,7 @@ fn offline_cli_signs_both_with_gpg_encrypted_test_mnemonic() {
     use std::process::Command;
     let now = chrono::Utc::now().timestamp();
     let mnemonic = bip39::Mnemonic::from_entropy(&[0; 32]).unwrap(); // Public test mnemonic.
-    let signer = hex::encode(minos::wallet::payment_key_hash(&mnemonic, 0));
+    let signer = hex::encode(minos::wallet::payment_key_hash(&mnemonic, 0).unwrap());
     let package = package_for_signer(&signer, now);
     let dir = std::env::temp_dir().join(format!("minos-airgap-test-{}-{now}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

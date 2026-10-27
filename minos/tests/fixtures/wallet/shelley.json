@@ -1,0 +1,7 @@
+{
+  "source": "https://github.com/IntersectMBO/cardano-addresses/blob/c75167069e954ae4f7b42df0d2db3828869be8c7/test/golden/addresses_test_walk_nut_penalty_hip_pave_soap_entry_language_right_filter_choice/actual",
+  "mnemonic": "test walk nut penalty hip pave soap entry language right filter choice",
+  "path": "m/1852'/1815'/0'/0/0",
+  "enterprise": "addr_test1vz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzerspjrlsz",
+  "base": "addr_test1qz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzer3jcu5d8ps7zex2k2xt3uqxgjqnnj83ws8lhrn648jjxtwq2ytjqp"
+}

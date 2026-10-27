@@ -1,0 +1,22 @@
+# Third-party Rust notices
+
+Generated with cargo-about 0.9.0 from the locked workspace for
+x86_64-unknown-linux-gnu. This inventory includes build/test dependencies as well
+as linked dependencies. Package and source links identify the unmodified upstream
+crate versions; each associated license text follows below. See
+`docs/dependencies.md` for native runtime and Elm distribution notices and the
+regeneration command. Do not remove copyright attributions from these texts.
+
+{{#each licenses}}
+## {{name}} ({{id}})
+
+Applies to:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.source}} — source: https://crates.io/api/v1/crates/{{crate.name}}/{{crate.version}}/download{{else}} — this workspace{{/if}}
+{{/each}}
+
+```text
+{{{text}}}
+```
+
+{{/each}}

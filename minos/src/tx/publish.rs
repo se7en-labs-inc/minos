@@ -1,4 +1,4 @@
-/// Build the three unsigned transactions that deploy a new treasury instance.
+/// Build an unsigned treasury deployment, including the bounded two-stage bundle.
 ///
 /// All three are combined into ONE transaction for atomicity:
 ///   1. Spends seed UTxO (consumed to guarantee oneshot NFT uniqueness)
@@ -20,20 +20,205 @@ use crate::scripts::{
 };
 use crate::types::MultisigScript;
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentReference {
+    pub transaction: String,
+    pub index: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentManifest {
+    pub version: u8,
+    pub network_id: u8,
+    pub instance: String,
+    pub treasury_script_hash: String,
+    pub vendor_script_hash: String,
+    pub publish_body_hash: String,
+    pub vendor_reference_body_hash: String,
+    /// Confirm this transaction/output before submitting vendor-reference.json.
+    pub vendor_reference_depends_on: DeploymentReference,
+    pub registry_reference: DeploymentReference,
+    pub treasury_reference: DeploymentReference,
+    pub vendor_reference: DeploymentReference,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentBundle {
+    pub publish: UnsignedTx,
+    pub vendor_reference: UnsignedTx,
+    pub manifest: DeploymentManifest,
+}
+
+/// Both body hashes are stable under later witness collection. Stage two is
+/// validated against the exact projected stage-one output, not a live UTxO claim.
+pub fn build_bundle(
+    params: PublishParams,
+    protocol: &crate::koios::ProtocolParams,
+) -> Result<DeploymentBundle> {
+    let minimum = minimum_registry_total(&params)?;
+    let input_coin =
+        params
+            .extra_fee_inputs
+            .iter()
+            .try_fold(params.seed_lovelace, |sum, input| {
+                sum.checked_add(input.lovelace)
+                    .context("deployment input ADA overflow")
+            })?;
+    let witnesses = super::fees::witness_count(
+        std::iter::once(params.admin_key_hash.as_slice()),
+        &params.fee_addr,
+        params.network_id,
+    )?;
+    let publish = super::fees::balance(
+        protocol,
+        input_coin
+            .checked_sub(minimum)
+            .context("insufficient deployment funds")?,
+        0,
+        witnesses,
+        |fee, _change| {
+            let mut stage = params.clone();
+            stage.fee = fee;
+            build_registry_stage(stage)
+        },
+    )?;
+    super::fees::validate_collateral(&publish.cbor_hex, protocol, &params.collateral)?;
+    let bytes = hex::decode(&publish.cbor_hex)?;
+    let tx = crate::metadata::transaction(&bytes)?;
+    let publish_hash = hex::encode(super::sign::tx_body_hash(&bytes)?);
+    let metadata = crate::metadata::auxiliary_1694(&tx)?.context("deployment metadata missing")?;
+    let instance = metadata["instance"]
+        .as_str()
+        .context("deployment instance missing")?
+        .to_owned();
+    let expected = crate::metadata::instance_scripts(&metadata["body"], &instance)?;
+    let registry: [u8; 28] = hex::decode(&instance)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid registry hash"))?;
+    let admin = admin_permission(&params.admin_keys, params.admin_threshold)?;
+    let script = parameterize_vendor(
+        &registry,
+        &VendorPermissions {
+            pause: admin.clone(),
+            resume: admin.clone(),
+            modify: admin,
+        },
+        params.vendor_expiration_ms,
+    )?;
+    anyhow::ensure!(
+        script_hash(&script).to_string() == expected.vendor_hash,
+        "deployment vendor hash mismatch"
+    );
+    let vendor_address = base_script_addr(&script_hash(&script), params.network_id);
+    let vendor_coin = super::fees::minimum_builder_coin(params.coins_per_utxo_byte, |coin| {
+        Ok(Output::new(vendor_address.clone(), coin)
+            .set_inline_script(ScriptKind::PlutusV3, script.clone()))
+    })?;
+    anyhow::ensure!(
+        tx.transaction_body.outputs.len() == 3,
+        "unexpected registry stage layout"
+    );
+    let funding =
+        crate::preflight::utxo_from_output(&publish_hash, 2, &tx.transaction_body.outputs[2])?;
+    let wallet_input = crate::coin_select::WalletUtxo::try_from(&funding)?;
+    let fee_address = PallasAddress::from_bech32(&params.fee_addr)?;
+    let fee_key = crate::coin_select::address_key_hash(&params.fee_addr, params.network_id)?;
+    let input_hash: [u8; 32] = hex::decode(&publish_hash)?
+        .try_into()
+        .expect("32-byte body hash");
+    let vendor_reference = super::fees::balance(
+        protocol,
+        wallet_input
+            .lovelace
+            .checked_sub(vendor_coin)
+            .context("stage-one change cannot fund vendor reference")?,
+        0,
+        1,
+        |fee, change| {
+            let built = StagingTransaction::new()
+                .input(Input::new(input_hash.into(), 2))
+                .output(
+                    Output::new(vendor_address.clone(), vendor_coin)
+                        .set_inline_script(ScriptKind::PlutusV3, script.clone()),
+                )
+                .output(crate::coin_select::change_output(
+                    fee_address.clone(),
+                    change,
+                    std::slice::from_ref(&wallet_input),
+                )?)
+                .fee(fee)
+                .network_id(params.network_id)
+                .valid_from_slot(params.valid_from_slot)
+                .invalid_from_slot(params.invalid_from_slot)
+                .disclosed_signer(fee_key.into())
+                .build_conway_raw()
+                .map_err(|error| anyhow::anyhow!("build vendor reference: {error}"))?;
+            Ok(UnsignedTx::new(
+                "vendor reference; requires confirmed publish change",
+                hex::encode(built.tx_bytes.0),
+            ))
+        },
+    )?;
+    crate::preflight::check_protocol(
+        &vendor_reference.cbor_hex,
+        std::slice::from_ref(&funding),
+        protocol,
+    )?;
+    crate::preflight::evaluate(
+        &hex::decode(&vendor_reference.cbor_hex)?,
+        &[funding],
+        protocol.evaluation_limits()?,
+        &protocol.v3_cost_model().context("missing V3 cost model")?,
+        0,
+    )?;
+    let vendor_hash = hex::encode(super::sign::tx_body_hash(&hex::decode(
+        &vendor_reference.cbor_hex,
+    )?)?);
+    let manifest = DeploymentManifest {
+        version: 1,
+        network_id: params.network_id,
+        instance,
+        treasury_script_hash: expected.treasury_hash,
+        vendor_script_hash: expected.vendor_hash,
+        publish_body_hash: publish_hash.clone(),
+        vendor_reference_body_hash: vendor_hash.clone(),
+        vendor_reference_depends_on: DeploymentReference {
+            transaction: publish_hash.clone(),
+            index: 2,
+        },
+        registry_reference: DeploymentReference {
+            transaction: publish_hash.clone(),
+            index: 0,
+        },
+        treasury_reference: DeploymentReference {
+            transaction: publish_hash,
+            index: 1,
+        },
+        vendor_reference: DeploymentReference {
+            transaction: vendor_hash,
+            index: 0,
+        },
+    };
+    Ok(DeploymentBundle {
+        publish,
+        vendor_reference,
+        manifest,
+    })
+}
+
 // Asset name for the registry NFT: "REGISTRY" = 0x5245474953545259
 const REGISTRY_ASSET_NAME: &[u8] = b"REGISTRY";
 
-// Min-ADA for each reference script output scales with script size.
-// Treasury script ≈ 5.3 kB flat → ~25 ADA; vendor ≈ 7.9 kB → ~36 ADA.
-const TREASURY_REF_ADA: u64 = 25_000_000;
-const VENDOR_REF_ADA: u64 = 36_000_000;
-// Minimum lovelace for the registry NFT output (2 ADA)
-const REGISTRY_OUTPUT_ADA: u64 = 2_000_000;
-
+#[derive(Clone)]
 pub struct PublishParams {
     // Seed UTxO — MUST be included in inputs; parameterizes the oneshot minting policy.
     pub seed_utxo_hash: String,
     pub seed_utxo_index: u64,
+    pub seed_lovelace: u64,
+    pub seed_assets: std::collections::BTreeMap<String, u64>,
 
     // Admin: single key hash used for ALL permissions (treasury + vendor).
     pub admin_key_hash: Vec<u8>,
@@ -55,7 +240,7 @@ pub struct PublishParams {
     pub collateral: crate::coin_select::WalletUtxo,
     pub fee_addr: String,
     pub fee: u64,
-    pub change_lovelace: u64,
+    pub coins_per_utxo_byte: u64,
 
     // Validity interval
     pub valid_from_slot: u64,
@@ -95,7 +280,49 @@ pub fn admin_permission(keys: &[Vec<u8>], threshold: u64) -> Result<MultisigScri
     })
 }
 
+/// Plan the three deployment outputs using the same applied scripts and encoder
+/// as the final builder. The sizing copy is never signed or submitted.
+pub fn minimum_output_total(params: &PublishParams) -> Result<u64> {
+    minimum_outputs(params, true)
+}
+
+pub fn minimum_registry_total(params: &PublishParams) -> Result<u64> {
+    minimum_outputs(params, false)
+}
+
+fn minimum_outputs(params: &PublishParams, atomic: bool) -> Result<u64> {
+    let mut sizing = params.clone();
+    sizing.seed_lovelace = u64::MAX;
+    sizing.seed_assets.clear();
+    sizing.extra_fee_inputs.clear();
+    sizing.fee = 0;
+    let built = build_inner(sizing, atomic)?;
+    let bytes = hex::decode(built.cbor_hex)?;
+    let tx: pallas_primitives::conway::Tx<'_> = pallas_codec::minicbor::decode(&bytes)?;
+    tx.transaction_body
+        .outputs
+        .iter()
+        .take(if atomic { 3 } else { 2 })
+        .try_fold(0u64, |total, output| {
+            total
+                .checked_add(
+                    pallas_traverse::MultiEraOutput::from_conway(output)
+                        .value()
+                        .coin(),
+                )
+                .context("publication minimum ADA overflow")
+        })
+}
+
 pub fn build(params: PublishParams) -> Result<UnsignedTx> {
+    build_inner(params, true)
+}
+
+pub fn build_registry_stage(params: PublishParams) -> Result<UnsignedTx> {
+    build_inner(params, false)
+}
+
+fn build_inner(params: PublishParams, atomic: bool) -> Result<UnsignedTx> {
     let admin_sig = admin_permission(&params.admin_keys, params.admin_threshold)?;
     anyhow::ensure!(
         params.admin_keys.contains(&params.admin_key_hash),
@@ -177,7 +404,20 @@ pub fn build(params: PublishParams) -> Result<UnsignedTx> {
     //    (c) Vendor reference script output
     //    (d) Change
     // -----------------------------------------------------------------------
-    let registry_output = Output::new(oneshot_addr, REGISTRY_OUTPUT_ADA)
+    let registry_coin = super::fees::minimum_builder_coin(params.coins_per_utxo_byte, |coin| {
+        Ok(Output::new(oneshot_addr.clone(), coin)
+            .add_asset(oneshot_hash, REGISTRY_ASSET_NAME.to_vec(), 1)?
+            .set_inline_datum(registry_datum.clone()))
+    })?;
+    let treasury_coin = super::fees::minimum_builder_coin(params.coins_per_utxo_byte, |coin| {
+        Ok(Output::new(treasury_addr.clone(), coin)
+            .set_inline_script(ScriptKind::PlutusV3, treasury_cbor.clone()))
+    })?;
+    let vendor_coin = super::fees::minimum_builder_coin(params.coins_per_utxo_byte, |coin| {
+        Ok(Output::new(vendor_addr.clone(), coin)
+            .set_inline_script(ScriptKind::PlutusV3, vendor_cbor.clone()))
+    })?;
+    let registry_output = Output::new(oneshot_addr, registry_coin)
         .add_asset(oneshot_hash, REGISTRY_ASSET_NAME.to_vec(), 1)
         .context("add REGISTRY asset to output")?
         .set_inline_datum(registry_datum);
@@ -185,13 +425,32 @@ pub fn build(params: PublishParams) -> Result<UnsignedTx> {
     // Pass CBOR-wrapped flat bytes to pallas-txbuilder.
     // The Cardano node's deserialiseScript CBOR-decodes the bytes before flat-decoding,
     // so scripts must be passed in their CBOR-wrapped form (59xxxx flat_bytes), not raw flat.
-    let treasury_ref_output = Output::new(treasury_addr, TREASURY_REF_ADA)
+    let treasury_ref_output = Output::new(treasury_addr, treasury_coin)
         .set_inline_script(ScriptKind::PlutusV3, treasury_cbor.clone());
 
-    let vendor_ref_output = Output::new(vendor_addr, VENDOR_REF_ADA)
+    let vendor_ref_output = Output::new(vendor_addr, vendor_coin)
         .set_inline_script(ScriptKind::PlutusV3, vendor_cbor.clone());
 
-    let change_output = Output::new(fee_addr, params.change_lovelace);
+    let mut wallet_inputs = params.extra_fee_inputs.clone();
+    wallet_inputs.push(crate::coin_select::WalletUtxo {
+        tx_hash: params.seed_utxo_hash.clone(),
+        output_index: params.seed_utxo_index,
+        lovelace: params.seed_lovelace,
+        has_native_assets: !params.seed_assets.is_empty(),
+        assets: params.seed_assets,
+    });
+    crate::coin_select::select_inputs(&wallet_inputs, 0)?;
+    let input_coin = wallet_inputs.iter().try_fold(0u64, |sum, input| {
+        sum.checked_add(input.lovelace)
+            .context("publish input ADA overflow")
+    })?;
+    let change_coin = input_coin
+        .checked_sub(registry_coin)
+        .and_then(|coin| coin.checked_sub(treasury_coin))
+        .and_then(|coin| coin.checked_sub(if atomic { vendor_coin } else { 0 }))
+        .and_then(|coin| coin.checked_sub(params.fee))
+        .context("insufficient ADA for publication outputs and fee")?;
+    let change_output = crate::coin_select::change_output(fee_addr, change_coin, &wallet_inputs)?;
 
     // -----------------------------------------------------------------------
     // 6. Collateral
@@ -224,10 +483,6 @@ pub fn build(params: PublishParams) -> Result<UnsignedTx> {
         .output(registry_output)
         // Treasury reference script output
         .output(treasury_ref_output)
-        // Vendor reference script output
-        .output(vendor_ref_output)
-        // Change back to fee wallet
-        .output(change_output)
         // Collateral (required for Plutus scripts)
         .collateral_input(collateral_input)
         // Validity
@@ -255,6 +510,11 @@ pub fn build(params: PublishParams) -> Result<UnsignedTx> {
         .add_language(ScriptKind::PlutusV3, params.v3_cost_model)
         // Required signer (admin must sign)
         .disclosed_signer(admin_hash);
+
+    if atomic {
+        staging = staging.output(vendor_ref_output);
+    }
+    staging = staging.output(change_output);
 
     // Extra fee inputs (if needed beyond seed)
     for fi in &params.extra_fee_inputs {
@@ -289,14 +549,6 @@ pub fn build(params: PublishParams) -> Result<UnsignedTx> {
     )?;
     let final_bytes = super::cbor_util::add_aux_data(&built.tx_bytes.0, &aux_cbor, &aux_hash)?;
     let cbor_hex = hex::encode(&final_bytes);
-
-    // Print the script hashes and policy ID for reference
-    eprintln!("Registry token (policy ID): {instance_id_hex}");
-    eprintln!(
-        "Treasury script hash:       {}",
-        hex::encode(*treasury_hash)
-    );
-    eprintln!("Vendor script hash:         {}", hex::encode(*vendor_hash));
 
     Ok(UnsignedTx::new("publish treasury instance", cbor_hex))
 }

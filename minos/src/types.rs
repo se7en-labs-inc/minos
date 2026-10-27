@@ -92,7 +92,12 @@ impl MultisigScript {
 
 impl VendorDatum {
     pub fn from_cbor_hex(hex: &str) -> Result<Self> {
+        anyhow::ensure!(
+            hex.len() <= 128 * 1024,
+            "vendor datum exceeds the CBOR size limit"
+        );
         let bytes = hex::decode(hex).context("invalid datum hex")?;
+        crate::cbor::validate(&bytes)?;
         let data: PlutusData = minicbor::decode(&bytes).context("cbor decode failed")?;
         decode_vendor_datum(&data)
     }
@@ -100,7 +105,7 @@ impl VendorDatum {
     pub fn matured_payouts(&self, now_ms: u64) -> Vec<&Payout> {
         self.payouts
             .iter()
-            .filter(|p| matches!(p.status, PayoutStatus::Active) && p.maturation <= now_ms)
+            .filter(|p| matches!(p.status, PayoutStatus::Active) && p.maturation < now_ms)
             .collect()
     }
 
@@ -462,3 +467,45 @@ pub struct WithdrawMilestone {
 
 pub const METADATA_CONTEXT: &str =
     "https://raw.githubusercontent.com/SundaeSwap-finance/treasury-contracts/refs/heads/main/offchain/src/metadata/context.jsonld";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn datum_reader_rejects_trailing_oversized_and_deep_cbor_before_typed_decode() {
+        let datum = VendorDatum {
+            vendor: MultisigScript::Signature {
+                key_hash: vec![1; 28],
+            },
+            payouts: vec![],
+        };
+        let encoded = hex::encode(datum.to_cbor_bytes());
+        assert!(VendorDatum::from_cbor_hex(&encoded).is_ok());
+        assert!(VendorDatum::from_cbor_hex(&format!("{encoded}00")).is_err());
+        assert!(VendorDatum::from_cbor_hex(&"00".repeat(65_537))
+            .unwrap_err()
+            .to_string()
+            .contains("size limit"));
+        assert!(VendorDatum::from_cbor_hex(&format!("{}00", "81".repeat(65))).is_err());
+    }
+    #[test]
+    fn maturity_matches_strict_contract_boundary_and_excludes_paused_payouts() {
+        let datum = VendorDatum {
+            vendor: MultisigScript::AnyOf { scripts: vec![] },
+            payouts: vec![
+                Payout {
+                    maturation: 10,
+                    value: AssetBundle(Default::default()),
+                    status: PayoutStatus::Active,
+                },
+                Payout {
+                    maturation: 9,
+                    value: AssetBundle(Default::default()),
+                    status: PayoutStatus::Paused,
+                },
+            ],
+        };
+        assert!(datum.matured_payouts(10).is_empty());
+        assert_eq!(datum.matured_payouts(11).len(), 1);
+    }
+}

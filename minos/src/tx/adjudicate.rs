@@ -43,11 +43,10 @@ pub struct AdjudicateParams {
     pub registry_utxo_index: u64,
     pub vendor_script_ref_hash: String,
     pub vendor_script_ref_index: u64,
-    pub treasury_script_ref_hash: String,
-    pub treasury_script_ref_index: u64,
 
     // Required signer — the pause (or resume) permission key hash
     pub admin_key_hash: Vec<u8>,
+    pub co_signer_hashes: Vec<Vec<u8>>,
 
     // Fee wallet
     pub fee_inputs: Vec<WalletUtxo>,
@@ -55,6 +54,7 @@ pub struct AdjudicateParams {
     pub fee_addr: String,
     pub fee: u64,
     pub change_lovelace: u64,
+    pub coins_per_utxo_byte: u64,
 
     // Validity interval
     // valid_from_slot must correspond to a POSIX time ≤ the earliest maturation
@@ -72,6 +72,7 @@ pub struct AdjudicateParams {
 }
 
 pub fn build(params: AdjudicateParams) -> Result<UnsignedTx> {
+    let mut wallet_change = params.change_lovelace;
     anyhow::ensure!(
         params.new_statuses.len() == params.current_datum.payouts.len(),
         "new_statuses length ({}) must equal payouts length ({})",
@@ -117,28 +118,24 @@ pub fn build(params: AdjudicateParams) -> Result<UnsignedTx> {
     // -----------------------------------------------------------------------
     // 3. Build vendor output (same value, new datum)
     // -----------------------------------------------------------------------
-    let mut vendor_output =
-        Output::new(vendor_pallas_addr, params.vendor_lovelace).set_inline_datum(new_datum_bytes);
-
-    for (asset_id, qty) in &params.vendor_assets {
-        if asset_id.is_empty() || *qty == 0 {
-            continue;
-        }
-        anyhow::ensure!(asset_id.len() >= 56, "asset_id too short: {asset_id}");
-        let policy_bytes: [u8; 28] = hex::decode(&asset_id[..56])
-            .context("asset policy decode")?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("policy must be 28 bytes"))?;
-        let asset_name = hex::decode(&asset_id[56..]).context("asset name decode")?;
-        vendor_output = vendor_output
-            .add_asset(Hash::from(policy_bytes), asset_name, *qty)
-            .context("add asset to vendor output")?;
-    }
+    let vendor_output = super::fees::funded_output(
+        params.coins_per_utxo_byte,
+        params.vendor_lovelace,
+        &mut wallet_change,
+        |coin| {
+            super::value::add_assets(
+                Output::new(vendor_pallas_addr.clone(), coin)
+                    .set_inline_datum(new_datum_bytes.clone()),
+                &params.vendor_assets,
+            )
+        },
+    )?;
 
     // -----------------------------------------------------------------------
     // 4. Change output
     // -----------------------------------------------------------------------
-    let change_output = Output::new(fee_pallas_addr, params.change_lovelace);
+    let change_output =
+        crate::coin_select::change_output(fee_pallas_addr, wallet_change, &params.fee_inputs)?;
 
     // -----------------------------------------------------------------------
     // 5. Parse vendor UTxO input
@@ -163,15 +160,6 @@ pub fn build(params: AdjudicateParams) -> Result<UnsignedTx> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("vendor script ref hash must be 32 bytes"))?;
     let vendor_ref_input = Input::new(Hash::from(vendor_ref_hash), params.vendor_script_ref_index);
-
-    let treasury_ref_hash: [u8; 32] = hex::decode(&params.treasury_script_ref_hash)
-        .context("treasury script ref hash")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("treasury script ref hash must be 32 bytes"))?;
-    let treasury_ref_input = Input::new(
-        Hash::from(treasury_ref_hash),
-        params.treasury_script_ref_index,
-    );
 
     // -----------------------------------------------------------------------
     // 7. Collateral
@@ -229,7 +217,6 @@ pub fn build(params: AdjudicateParams) -> Result<UnsignedTx> {
         .input(vendor_input.clone())
         .reference_input(registry_ref_input)
         .reference_input(vendor_ref_input)
-        .reference_input(treasury_ref_input)
         .output(vendor_output)
         .output(change_output)
         .collateral_input(collateral_input)
@@ -259,6 +246,9 @@ pub fn build(params: AdjudicateParams) -> Result<UnsignedTx> {
     // -----------------------------------------------------------------------
     // 11. Build raw tx and inject metadata
     // -----------------------------------------------------------------------
+    for key in &params.co_signer_hashes {
+        staging = staging.disclosed_signer(Hash::from(<[u8; 28]>::try_from(key.as_slice())?));
+    }
     let built = staging
         .build_conway_raw()
         .map_err(|e| anyhow::anyhow!("build_conway_raw: {e}"))?;

@@ -134,6 +134,12 @@ pub fn add_treasury_withdrawal(
     reward_steps: u64,
     v3_cost_model: &[i64],
 ) -> Result<Vec<u8>> {
+    let tx: pallas_primitives::conway::Tx<'_> = pallas_codec::minicbor::decode(tx_cbor)?;
+    anyhow::ensure!(
+        tx.transaction_body.withdrawals.as_ref().is_none_or(|withdrawals| withdrawals.is_empty()),
+        "multiple reward withdrawals are unsupported; refusing to replace existing withdrawals or redeemer indices"
+    );
+    anyhow::ensure!(network_id <= 1, "unsupported address network ID");
     let mut dec = Decoder::new(tx_cbor);
     dec.array().context("tx: outer array")?;
 

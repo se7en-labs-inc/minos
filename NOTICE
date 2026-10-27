@@ -1,0 +1,15 @@
+Minos includes compiled Cardano treasury contract code from:
+
+  SundaeSwap-finance/treasury-contracts
+  https://github.com/SundaeSwap-finance/treasury-contracts
+  Revision: 84e105a9ff797fdf9873e0a5b71df9f108d8c008
+
+The upstream aiken.toml and blueprint declare Apache-2.0. The pinned revision
+contains no separate LICENSE or NOTICE file. See docs/contracts.md for compiler,
+dependency, bytecode and parameterization provenance.
+
+Public wallet test vectors are attributed in minos/tests/fixtures/wallet/README.md.
+Historical chain regression data are described in their fixture directories.
+
+Third-party Rust and Elm dependencies retain their own licenses. This notice
+does not replace their notices or grant rights beyond their respective licenses.

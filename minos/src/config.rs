@@ -9,10 +9,7 @@ pub enum Network {
 
 impl Network {
     pub fn portal_graphql_url(&self) -> &str {
-        match self {
-            Network::Preview => "https://api.treasury.preview.sundae.fi/graphql",
-            Network::Mainnet => "https://api.treasury.sundae.fi/graphql",
-        }
+        "http://127.0.0.1:8080/graphql"
     }
 
     pub fn koios_base_url(&self) -> &str {

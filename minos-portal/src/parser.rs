@@ -2,7 +2,6 @@
 ///
 /// Koios returns metadata as a JSON object with string keys. The 1694 key holds
 /// the decoded metadata map. We extract the body.event field and route accordingly.
-use anyhow::Result;
 use serde_json::Value;
 
 use crate::types::{Event, EventType, Milestone, Project};
@@ -24,7 +23,7 @@ pub fn parse_metadata(
     // Koios wraps metadata as { "1694": { ... } } or as a decoded object directly
     let meta = raw.get("1694").unwrap_or(raw);
 
-    let instance_id = meta.get("instance")?.as_str()?.to_string();
+    let instance_id = meta.get("instance")?.as_str()?.to_ascii_lowercase();
     let body = meta.get("body")?;
     let event_str = body.get("event")?.as_str()?;
     let event_type = EventType::from_str(event_str)?;
@@ -73,13 +72,15 @@ fn extract_project_id(body: &Value, event_type: EventType) -> Option<String> {
 
 fn parse_fund_project(instance_id: &str, fund_tx: &str, body: &Value) -> Option<Project> {
     let id = body.get("identifier")?.as_str()?.to_string();
-    let label = rejoined_string(body.get("label")?);
-    let description = body.get("description").map(rejoined_string);
+    if id.trim().is_empty() {
+        return None;
+    }
+    let label = checked_string(body.get("label")?)?;
+    let description = optional_text(body.get("description"))?;
     let vendor_label = body
         .get("vendor")
         .and_then(|v| v.get("label"))
-        .map(rejoined_string)
-        .unwrap_or_default();
+        .and_then(checked_string)?;
 
     let milestones = parse_milestones(body)?;
 
@@ -91,56 +92,74 @@ fn parse_fund_project(instance_id: &str, fund_tx: &str, body: &Value) -> Option<
         vendor_label,
         milestones,
         fund_tx: fund_tx.to_string(),
+        ordered_milestones: body.get("milestones").is_some_and(Value::is_array),
     })
 }
 
 fn parse_milestones(body: &Value) -> Option<Vec<Milestone>> {
-    // Milestones can be a map (spec v2: {"id": {...}}) or an array (older format)
+    // The pinned format is an ordered list. Legacy maps retain their IDs but
+    // cannot establish payout order merely from JSON iteration or lexical order.
     let ms_val = body.get("milestones")?;
-
-    if let Some(map) = ms_val.as_object() {
-        let mut milestones: Vec<Milestone> = map
-            .iter()
-            .filter_map(|(id, val)| {
-                Some(Milestone {
-                    identifier: id.clone(),
-                    label: rejoined_string(val.get("label")?),
-                    description: val.get("description").map(rejoined_string),
-                    acceptance_criteria: val.get("acceptanceCriteria").map(rejoined_string),
-                    maturation_ms: 0, // filled from on-chain datum
-                    requires_evidence: val
-                        .get("requiresEvidence")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
-                })
-            })
-            .collect();
-        // Preserve insertion order as display order
-        milestones.sort_by(|a, b| a.identifier.cmp(&b.identifier));
-        return Some(milestones);
+    fn milestone(id: &str, value: &Value) -> Option<Milestone> {
+        if id.trim().is_empty() || !value.is_object() {
+            return None;
+        }
+        let requires_evidence = match value.get("requiresEvidence") {
+            None => true,
+            Some(Value::Bool(value)) => *value,
+            Some(value) if value.as_u64() == Some(0) => false,
+            Some(value) if value.as_u64() == Some(1) => true,
+            _ => return None,
+        };
+        Some(Milestone {
+            identifier: id.into(),
+            label: optional_text(value.get("label"))?.unwrap_or_else(|| id.into()),
+            description: optional_text(value.get("description"))?,
+            acceptance_criteria: optional_text(value.get("acceptanceCriteria"))?,
+            maturation_ms: 0,
+            requires_evidence,
+        })
     }
-
-    if let Some(arr) = ms_val.as_array() {
-        let milestones = arr
+    let milestones = if let Some(map) = ms_val.as_object() {
+        map.iter()
+            .map(|(id, value)| milestone(id, value))
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        ms_val
+            .as_array()?
             .iter()
-            .filter_map(|val| {
-                Some(Milestone {
-                    identifier: val.get("identifier")?.as_str()?.to_string(),
-                    label: rejoined_string(val.get("label")?),
-                    description: val.get("description").map(rejoined_string),
-                    acceptance_criteria: val.get("acceptanceCriteria").map(rejoined_string),
-                    maturation_ms: 0,
-                    requires_evidence: val
-                        .get("requiresEvidence")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
-                })
-            })
-            .collect();
-        return Some(milestones);
+            .map(|value| milestone(value.get("identifier")?.as_str()?, value))
+            .collect::<Option<Vec<_>>>()?
+    };
+    if milestones
+        .iter()
+        .map(|milestone| &milestone.identifier)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != milestones.len()
+    {
+        return None;
     }
+    Some(milestones)
+}
 
-    None
+fn checked_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Array(chunks) => chunks
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .map(|chunks| chunks.concat()),
+        _ => None,
+    }
+}
+
+fn optional_text(value: Option<&Value>) -> Option<Option<String>> {
+    match value {
+        None => Some(None),
+        Some(value) => Some(Some(checked_string(value)?)),
+    }
 }
 
 /// Reconstruct a string that may have been split into ≤64-byte chunks as a CBOR array.

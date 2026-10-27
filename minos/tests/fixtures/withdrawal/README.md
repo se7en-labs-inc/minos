@@ -1,11 +1,11 @@
 # Withdrawal regression data
 
-These are public chain data for CTW-26-0024, instance
+These are historical public chain data for treasury instance
 `51486a2f1496d4d3a688a9b111971aa9b731ed045d900b601345ca4e`.
 No wallet material or signing witnesses are included.
 
-- `original.json`: snapshot of the user's unsigned
-  `se7en-withdraw-initial.txbody`, captured 2026-10-12. It already includes the
+- `original.json`: snapshot of an unsigned withdrawal candidate,
+  captured 2026-10-12. It already includes the
   corrected separate registry reference and allowlist staking withdrawal.
   It is a historical candidate, not evidence of ledger acceptance.
 - `utxos.json`: seven outputs resolved through Koios `utxo_info` with
@@ -13,6 +13,8 @@ No wallet material or signing witnesses are included.
   Includes vendor input, fee input, collateral, registry and three script refs.
 - `params.json`: Koios `epoch_params?limit=1&order=epoch_no.desc`, epoch 661,
   protocol major 11; retains the protocol fields relevant to this test.
+  `max_val_size = 5000` was subsequently supplied as a synthetic validation bound
+  for builder tests; it is not attributed to the original captured response.
 
 Tests run entirely offline. Fixture values are historical and must never be used
 as live UTxO availability, current protocol parameters or submission approval.

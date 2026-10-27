@@ -28,10 +28,12 @@ fn root_key(entropy: &[u8], passphrase: &[u8]) -> XPrv {
 }
 
 /// Derive the account XPrv at m/1852'/1815'/<account>'.
-fn account_xprv(root: &XPrv, account: u32) -> XPrv {
-    root.derive(SCHEME, PURPOSE)
+fn account_xprv(root: &XPrv, account: u32) -> Result<XPrv> {
+    anyhow::ensure!(account < 0x80000000, "account index must be less than 2^31");
+    Ok(root
+        .derive(SCHEME, PURPOSE)
         .derive(SCHEME, COIN_TYPE)
-        .derive(SCHEME, account | 0x80000000)
+        .derive(SCHEME, account | 0x80000000))
 }
 
 /// Derive a child key at <role>/<index> (soft derivation) under an account key.
@@ -46,10 +48,10 @@ fn vkey_hash(xprv: &XPrv) -> Hash<28> {
 }
 
 /// Derive the payment key (role=0, index=0) for an account from entropy.
-fn payment_key_for_account(entropy: &[u8], account: u32) -> XPrv {
+fn payment_key_for_account(entropy: &[u8], account: u32) -> Result<XPrv> {
     let root = root_key(entropy, b"");
-    let acct = account_xprv(&root, account);
-    child_xprv(&acct, 0, 0)
+    let acct = account_xprv(&root, account)?;
+    Ok(child_xprv(&acct, 0, 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -57,32 +59,34 @@ fn payment_key_for_account(entropy: &[u8], account: u32) -> XPrv {
 // ---------------------------------------------------------------------------
 
 /// Payment key hash (28 bytes) for account N — used as `--admin-key` in `minos publish`.
-pub fn payment_key_hash(mnemonic: &Mnemonic, account: u32) -> Hash<28> {
+pub fn payment_key_hash(mnemonic: &Mnemonic, account: u32) -> Result<Hash<28>> {
     let entropy = mnemonic.to_entropy();
-    vkey_hash(&payment_key_for_account(&entropy, account))
+    Ok(vkey_hash(&payment_key_for_account(&entropy, account)?))
 }
 
 /// Enterprise address (payment-only, no staking) for account N.
-pub fn enterprise_address(mnemonic: &Mnemonic, account: u32, network_id: u8) -> Address {
+pub fn enterprise_address(mnemonic: &Mnemonic, account: u32, network_id: u8) -> Result<Address> {
+    anyhow::ensure!(network_id <= 1, "supported address network IDs are 0 and 1");
     let entropy = mnemonic.to_entropy();
-    let pay_key = payment_key_for_account(&entropy, account);
+    let pay_key = payment_key_for_account(&entropy, account)?;
     let pay_hash = vkey_hash(&pay_key);
     let network = if network_id == 1 {
         Network::Mainnet
     } else {
         Network::Testnet
     };
-    Address::Shelley(ShelleyAddress::new(
+    Ok(Address::Shelley(ShelleyAddress::new(
         network,
         ShelleyPaymentPart::key_hash(pay_hash),
         ShelleyDelegationPart::Null,
-    ))
+    )))
 }
 
 /// Derive the base-address form using payment 0/0 and stake 2/0 of this account.
-pub fn base_address(mnemonic: &Mnemonic, account: u32, network_id: u8) -> Address {
-    let account = account_xprv(&root_key(&mnemonic.to_entropy(), b""), account);
-    Address::Shelley(ShelleyAddress::new(
+pub fn base_address(mnemonic: &Mnemonic, account: u32, network_id: u8) -> Result<Address> {
+    anyhow::ensure!(network_id <= 1, "supported address network IDs are 0 and 1");
+    let account = account_xprv(&root_key(&mnemonic.to_entropy(), b""), account)?;
+    Ok(Address::Shelley(ShelleyAddress::new(
         if network_id == 1 {
             Network::Mainnet
         } else {
@@ -90,19 +94,23 @@ pub fn base_address(mnemonic: &Mnemonic, account: u32, network_id: u8) -> Addres
         },
         ShelleyPaymentPart::key_hash(vkey_hash(&child_xprv(&account, 0, 0))),
         ShelleyDelegationPart::key_hash(vkey_hash(&child_xprv(&account, 2, 0))),
-    ))
+    )))
 }
 
 /// Sign the tx body hash with the account N payment key.
 /// Returns (vkey_32_bytes, signature_64_bytes).
-pub fn sign_tx_body(mnemonic: &Mnemonic, account: u32, body_hash: &[u8]) -> ([u8; 32], [u8; 64]) {
+pub fn sign_tx_body(
+    mnemonic: &Mnemonic,
+    account: u32,
+    body_hash: &[u8],
+) -> Result<([u8; 32], [u8; 64])> {
     let entropy = mnemonic.to_entropy();
-    let key = payment_key_for_account(&entropy, account);
+    let key = payment_key_for_account(&entropy, account)?;
     let xpub = key.public();
     let sig = key.sign::<()>(body_hash);
     let vk: [u8; 32] = xpub.as_ref()[..32].try_into().unwrap();
     let sig_bytes: [u8; 64] = *sig.to_bytes();
-    (vk, sig_bytes)
+    Ok((vk, sig_bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -131,33 +139,71 @@ pub fn load_mnemonic(path: &std::path::Path) -> Result<Mnemonic> {
     Mnemonic::parse(text.trim()).map_err(|e| anyhow::anyhow!("invalid mnemonic: {e}"))
 }
 
-/// Save a mnemonic to a file. If `gpg_recipient` is set, encrypts with GPG armor.
+/// Save privately to a new file, refusing existing files and symlinks.
+/// If `gpg_recipient` is set, encryption must succeed before creating the output.
 pub fn save_mnemonic(
     mnemonic: &Mnemonic,
     path: &std::path::Path,
     gpg_recipient: Option<&str>,
 ) -> Result<()> {
+    use std::io::Write;
+
     let phrase = mnemonic.words().collect::<Vec<_>>().join(" ");
-    if let Some(recipient) = gpg_recipient {
-        use std::io::Write;
+    let bytes = if let Some(recipient) = gpg_recipient {
         let mut child = std::process::Command::new("gpg")
-            .args(["--encrypt", "--armor", "--recipient", recipient, "--output"])
-            .arg(path)
+            .args(["--batch", "--encrypt", "--armor", "--recipient", recipient])
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .context("gpg encrypt: failed to spawn gpg")?;
-        child
+        let written = child
             .stdin
-            .as_mut()
-            .unwrap()
+            .take()
+            .context("gpg encrypt: missing stdin")?
             .write_all(phrase.as_bytes())
-            .context("gpg: write mnemonic to stdin")?;
-        let status = child.wait().context("gpg encrypt: wait")?;
-        if !status.success() {
-            anyhow::bail!("gpg encrypt failed");
+            .context("gpg: write mnemonic to stdin");
+        if let Err(error) = written {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
         }
+        let encrypted = child.wait_with_output().context("gpg encrypt: wait")?;
+        anyhow::ensure!(encrypted.status.success(), "gpg encrypt failed");
+        encrypted.stdout
     } else {
-        std::fs::write(path, &phrase).context("write mnemonic file")?;
+        phrase.into_bytes()
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    #[cfg(not(unix))]
+    anyhow::bail!("private wallet file creation is supported only on Unix");
+
+    let mut file = options.open(path).context("create private wallet file")?;
+    file.write_all(&bytes).context("write wallet file")?;
+    file.sync_all().context("sync wallet file")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cip3_icarus_root_vectors() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/wallet/icarus.json")).unwrap();
+        let mnemonic = bip39::Mnemonic::parse(fixture["mnemonic"].as_str().unwrap()).unwrap();
+        for vector in fixture["vectors"].as_array().unwrap() {
+            let root = super::root_key(
+                &mnemonic.to_entropy(),
+                vector["passphrase"].as_str().unwrap().as_bytes(),
+            );
+            assert_eq!(hex::encode(root.as_ref()), vector["root"].as_str().unwrap());
+        }
+    }
 }

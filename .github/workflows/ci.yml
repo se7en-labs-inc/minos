@@ -1,0 +1,33 @@
+name: Release checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@c5a866b6ab867e88becbed4467b93592bce69f8a # v21
+      - name: Check Rust formatting
+        run: nix develop --no-update-lock-file --command cargo fmt --all -- --check
+      - name: Check strict workspace lints
+        run: nix develop --no-update-lock-file --command cargo clippy --workspace --all-targets --locked -- --deny warnings
+      - name: Run workspace tests
+        run: nix develop --no-update-lock-file --command cargo test --workspace --locked
+      - name: Build CLI, portal and UI packages with integration tests
+        run: nix build --no-update-lock-file .#minos .#minos-ui --no-link
+      - name: Run flake checks
+        run: nix flake check --no-update-lock-file

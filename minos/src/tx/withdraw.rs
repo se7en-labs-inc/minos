@@ -9,6 +9,22 @@ use pallas_txbuilder::{BuildConway, ExUnits, Input, Output, ScriptKind, StagingT
 
 use super::UnsignedTx;
 
+/// The contract requires continuation whenever value remains, even after the
+/// last scheduled payout. Unscheduled tokens belong to this residual value.
+pub fn continuing_datum(
+    original: &crate::types::VendorDatum,
+    remaining: Vec<crate::types::Payout>,
+    residual: &super::value::Value,
+) -> Option<Vec<u8>> {
+    (!remaining.is_empty() || !residual.is_zero()).then(|| {
+        crate::types::VendorDatum {
+            vendor: original.vendor.clone(),
+            payouts: remaining,
+        }
+        .to_cbor_bytes()
+    })
+}
+
 #[derive(Clone)]
 pub struct WithdrawParams {
     // Portal data — vendor UTxO
@@ -21,7 +37,7 @@ pub struct WithdrawParams {
     pub matured_assets: Vec<(String, u64)>, // (assetId, qty)
 
     // Remaining payouts — sent back to vendor script with updated datum
-    /// If empty, no remaining output is produced (UTxO fully consumed)
+    /// None only when no payouts and no value remain.
     pub remaining_datum_bytes: Option<Vec<u8>>,
     pub remaining_lovelace: u64,
     pub remaining_assets: Vec<(String, u64)>,
@@ -41,6 +57,7 @@ pub struct WithdrawParams {
     pub fee_addr: String, // bech32 change address
     pub fee: u64,
     pub change_lovelace: u64,
+    pub coins_per_utxo_byte: u64,
 
     // Destination address for matured funds
     pub dest_addr: String, // bech32
@@ -67,6 +84,11 @@ pub struct WithdrawParams {
 }
 
 pub fn build(params: WithdrawParams) -> Result<UnsignedTx> {
+    let mut wallet_change = params.change_lovelace;
+    anyhow::ensure!(
+        params.staking_script_hashes.len() <= 1,
+        "multiple reward withdrawals are unsupported"
+    );
     // -----------------------------------------------------------------------
     // 1. Encode CIP-100 metadata and compute hash
     // -----------------------------------------------------------------------
@@ -131,45 +153,34 @@ pub fn build(params: WithdrawParams) -> Result<UnsignedTx> {
     // -----------------------------------------------------------------------
     // 5. Build destination output (matured funds)
     // -----------------------------------------------------------------------
-    let mut dest_output = Output::new(dest_pallas_addr, params.matured_lovelace);
-    for (asset_id, qty) in &params.matured_assets {
-        if asset_id.is_empty() {
-            continue;
-        }
-        anyhow::ensure!(asset_id.len() >= 56, "asset_id too short: {asset_id}");
-        let policy_bytes: [u8; 28] = hex::decode(&asset_id[..56])
-            .context("matured asset policy_id decode")?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("policy_id must be 28 bytes"))?;
-        let asset_name = hex::decode(&asset_id[56..]).context("matured asset name decode")?;
-        dest_output = dest_output
-            .add_asset(Hash::from(policy_bytes), asset_name, *qty)
-            .context("add_asset on dest output")?;
-    }
+    let dest_output = super::fees::funded_output(
+        params.coins_per_utxo_byte,
+        params.matured_lovelace,
+        &mut wallet_change,
+        |coin| {
+            super::value::add_assets(
+                Output::new(dest_pallas_addr.clone(), coin),
+                &params.matured_assets,
+            )
+        },
+    )?;
 
     // -----------------------------------------------------------------------
     // 6. Optionally build "remaining" output (back to vendor script)
     // -----------------------------------------------------------------------
     let remaining_output: Option<Output> = if let Some(datum_bytes) = params.remaining_datum_bytes {
-        let mut out = Output::new(vendor_pallas_addr, params.remaining_lovelace)
-            .set_inline_datum(datum_bytes);
-        for (asset_id, qty) in &params.remaining_assets {
-            if asset_id.is_empty() {
-                continue;
-            }
-            anyhow::ensure!(
-                asset_id.len() >= 56,
-                "remaining asset_id too short: {asset_id}"
-            );
-            let policy_bytes: [u8; 28] = hex::decode(&asset_id[..56])
-                .context("remaining asset policy_id decode")?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("policy_id must be 28 bytes"))?;
-            let asset_name = hex::decode(&asset_id[56..]).context("remaining asset name decode")?;
-            out = out
-                .add_asset(Hash::from(policy_bytes), asset_name, *qty)
-                .context("add_asset on remaining output")?;
-        }
+        let out = super::fees::funded_output(
+            params.coins_per_utxo_byte,
+            params.remaining_lovelace,
+            &mut wallet_change,
+            |coin| {
+                super::value::add_assets(
+                    Output::new(vendor_pallas_addr.clone(), coin)
+                        .set_inline_datum(datum_bytes.clone()),
+                    &params.remaining_assets,
+                )
+            },
+        )?;
         Some(out)
     } else {
         None
@@ -178,7 +189,8 @@ pub fn build(params: WithdrawParams) -> Result<UnsignedTx> {
     // -----------------------------------------------------------------------
     // 7. Build change output
     // -----------------------------------------------------------------------
-    let change_output = Output::new(fee_pallas_addr, params.change_lovelace);
+    let change_output =
+        crate::coin_select::change_output(fee_pallas_addr, wallet_change, &params.fee_inputs)?;
 
     // -----------------------------------------------------------------------
     // 8. Parse collateral
@@ -269,9 +281,7 @@ pub fn build(params: WithdrawParams) -> Result<UnsignedTx> {
     let mut final_cbor = super::cbor_util::add_aux_data(tx_cbor, &aux_data_cbor, &aux_data_hash)
         .context("add_aux_data")?;
 
-    // Add staking withdrawal(s) for Script multisig variants (e.g. allowlist_vendor).
-    // Each call appends a reward redeemer, inserts the withdrawal entry in the body,
-    // and recomputes script_data_hash.
+    // Only one reward script is supported, with redeemer index zero.
     for script_hash in &params.staking_script_hashes {
         final_cbor = super::cbor_util::add_treasury_withdrawal(
             &final_cbor,

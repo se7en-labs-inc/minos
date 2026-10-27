@@ -1,12 +1,14 @@
 pub mod adjudicate;
 pub mod cbor_util;
 pub mod complete;
+pub mod fees;
 pub mod fund;
 pub mod metadata;
 pub mod mint;
 pub mod modify;
 pub mod publish;
 pub mod sign;
+pub mod value;
 pub mod withdraw;
 
 use serde::{Deserialize, Serialize};

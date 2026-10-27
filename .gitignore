@@ -1,4 +1,5 @@
 target
+/CONTEXT.md
 /m21-airgap-request.json
 /m21-airgap-review.json
 /m21-airgap-signed.json
