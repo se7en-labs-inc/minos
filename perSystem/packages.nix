@@ -36,6 +36,7 @@
         ../docs/releasing.md
         ../docs/preview-rehearsal.md
         ../docs/dependencies.md
+        ../docs/invoices.md
         ../specs/001-open-source-release
         ../specs/portal-airgap-completion/airgap-quickstart.md
         ../minos-portal/minos-portal.example.toml
@@ -183,6 +184,7 @@
               docs/contracts.md docs/operations.md docs/support-matrix.md \
               docs/releasing.md docs/preview-rehearsal.md \
               docs/dependencies.md \
+              docs/invoices.md \
               specs/portal-airgap-completion/airgap-quickstart.md \
               specs/001-open-source-release/spec.md \
               specs/001-open-source-release/plan.md \

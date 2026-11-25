@@ -89,6 +89,8 @@ and expected body hash before signing. [Airgap completion](specs/portal-airgap-c
 describes detached evidence signatures and assembly.
 The [monthly MAF submission runbook](docs/maf-submission.md) records the Se7en
 mainnet reference scripts and the prepare/sign/upload/confirm procedure.
+For private milestone invoices, see the [invoice runbook](docs/invoices.md):
+prepare an invoice request, sign offline, upload privately and confirm attachment.
 
 Building and signing do not submit. Explicit submission is a separate operation:
 

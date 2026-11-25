@@ -25,6 +25,7 @@ use mint::cmd_mint;
 
 mod airgap_cli;
 mod config;
+mod invoice_cli;
 mod maf;
 use minos::{coin_select, koios, node, portal, references, tx, types, wallet};
 
@@ -162,6 +163,11 @@ enum WalletCmd {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Attach, confirm and retrieve private milestone invoices (no chain transaction).
+    Invoice {
+        #[command(subcommand)]
+        cmd: invoice_cli::InvoiceCmd,
+    },
     /// Generate a shell completion script without contacting any services.
     Completions {
         #[arg(value_enum)]
@@ -736,6 +742,11 @@ async fn main() -> Result<()> {
         _ => None,
     };
     // Dispatch offline work before constructing any portal/node clients.
+    if matches!(&cli.command, Commands::Invoice { cmd } if cmd.is_offline()) {
+        if let Commands::Invoice { cmd } = cli.command {
+            return invoice_cli::offline(cmd);
+        }
+    }
     if let Commands::Airgap { cmd } = cli.command {
         return airgap_cli::run(cmd);
     }
@@ -748,7 +759,11 @@ async fn main() -> Result<()> {
         .portal
         .as_deref()
         .unwrap_or_else(|| cli.network.portal_graphql_url());
-    let portal = Portal::new(portal_url);
+    let portal = if matches!(&cli.command, Commands::Invoice { .. }) {
+        Portal::private(portal_url)
+    } else {
+        Portal::new(portal_url)
+    };
 
     let ds: DataSource = if let Some(socket) = cli.node_socket {
         let magic = cli
@@ -763,6 +778,9 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
+        Commands::Invoice { cmd } => {
+            invoice_cli::online(cmd, &portal, cli.network.network_id()).await
+        }
         Commands::CloneProject {
             vendor_label,
             ada_per_milestone,

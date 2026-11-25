@@ -88,6 +88,25 @@ printf '%s\n' "${COMPREPLY[@]}"
         assert!(airgap.contains(&subcommand.into()));
     }
     assert!(complete(&["minos", "airgap", "sign", "--p"]).contains(&"--package".into()));
+    let invoices = complete(&["minos", "invoice", ""]);
+    for command in [
+        "prepare-package",
+        "sign",
+        "upload-package",
+        "confirm",
+        "unlock",
+        "list",
+        "download",
+    ] {
+        assert!(
+            invoices.contains(&command.into()),
+            "invoice candidates: {invoices:?}"
+        );
+    }
+    assert!(
+        complete(&["minos", "invoice", "prepare-package", "--invoice-d"])
+            .contains(&"--invoice-date".into())
+    );
     let networks = complete(&["minos", "--network", ""]);
     for network in ["preview", "mainnet"] {
         assert!(networks.contains(&network.into()));

@@ -4,6 +4,7 @@ pub mod coin_select;
 pub mod cose;
 pub mod evidence;
 pub mod http;
+pub mod invoice;
 pub mod koios;
 pub mod metadata;
 pub mod node;

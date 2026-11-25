@@ -36,6 +36,18 @@ impl ReadSchema {
 }
 
 impl Portal {
+    /// Private invoice tokens and signed payloads must not follow redirects.
+    pub fn private(url: &str) -> Self {
+        Self {
+            client: crate::http::client_builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("HTTP client configuration"),
+            url: url.to_string(),
+            read_schema: tokio::sync::OnceCell::new(),
+        }
+    }
+
     pub fn new(url: &str) -> Self {
         Self {
             client: crate::http::client_builder()

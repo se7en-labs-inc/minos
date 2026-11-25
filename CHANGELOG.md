@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add private milestone invoice upload/confirmation, offline wallet authorization,
+  confirmation recovery and scoped invoice listing/download with SHA-256 checks.
+
 - Generate shell completions with `minos completions <shell>` and install Bash,
   Zsh and Fish completions with the Nix package.
 
