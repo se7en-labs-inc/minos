@@ -87,6 +87,8 @@ original body/auxiliary bytes are preserved. Accounts from one mnemonic represen
 separate roles but share the same underlying seed. Inspect the complete transaction
 and expected body hash before signing. [Airgap completion](specs/portal-airgap-completion/airgap-quickstart.md)
 describes detached evidence signatures and assembly.
+The [monthly MAF submission runbook](docs/maf-submission.md) records the Se7en
+mainnet reference scripts and the prepare/sign/upload/confirm procedure.
 
 Building and signing do not submit. Explicit submission is a separate operation:
 

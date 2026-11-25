@@ -1,5 +1,9 @@
 # One airgap round trip using Minos
 
+For the Se7en Labs monthly mainnet submission, use the
+[MAF submission runbook](../../docs/maf-submission.md), including its required
+allowlist reference and observed upload-authorization freshness constraint.
+
 Install updated Minos on the airgap using your usual deployment process. All
 functionality is in the existing `minos` executable. It reuses the same
 GPG-encrypted mnemonic wallet as `minos wallet sign`, account 0 by default.
